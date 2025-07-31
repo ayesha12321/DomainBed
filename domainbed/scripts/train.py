@@ -170,15 +170,15 @@ if __name__ == "__main__":
         for i in range(len(out_splits))]
     eval_loader_names += ['env{}_uda'.format(i)
         for i in range(len(uda_splits))]
-
     algorithm_class = algorithms.get_algorithm_class(args.algorithm)
     algorithm = algorithm_class(dataset.input_shape, dataset.num_classes, len(dataset) - len(args.test_envs), hparams)
+    # print(">>> [DEBUG] Initializing algorithm:", args.algorithm)
 
     if algorithm_dict is not None:
         algorithm.load_state_dict(algorithm_dict)
 
     algorithm.to(device)
-
+    
     train_minibatches_iterator = zip(*train_loaders)
     uda_minibatches_iterator = zip(*uda_loaders)
     checkpoint_vals = collections.defaultdict(lambda: [])
@@ -187,7 +187,7 @@ if __name__ == "__main__":
 
     n_steps = args.steps or dataset.N_STEPS
     checkpoint_freq = args.checkpoint_freq or dataset.CHECKPOINT_FREQ
-
+    # print(f">>> [DEBUG] Steps per epoch: {steps_per_epoch}, Total steps: {n_steps}")
     def save_checkpoint(filename):
         if args.skip_model_save:
             return
@@ -204,60 +204,85 @@ if __name__ == "__main__":
 
     last_results_keys = None
     for step in range(start_step, n_steps):
+        print(f"\n>>> [DEBUG] ===== Step {step+1}/{n_steps} =====")
+        print(f">>> [DEBUG] GPU Memory before step: {torch.cuda.memory_allocated() / (1024**3):.2f} GB")
+
         step_start_time = time.time()
-        minibatches_device = [(x.to(device), y.to(device))
-            for x,y in next(train_minibatches_iterator)]
+
+        # ---- Load minibatches ----
+        try:
+            minibatches_device = [(x.to(device), y.to(device))
+                                  for x, y in next(train_minibatches_iterator)]
+        except Exception as e:
+            print(f">>> [ERROR] Failed to load minibatch: {e}")
+            break
+
+        # ---- Handle UDA minibatch ----
         if args.task == "domain_adaptation":
-            uda_device = [x.to(device)
-                for x,_ in next(uda_minibatches_iterator)]
+            try:
+                uda_device = [x.to(device) for x, _ in next(uda_minibatches_iterator)]
+                print(">>> [DEBUG] UDA minibatch loaded.")
+            except StopIteration:
+                print(">>> [WARN] No UDA minibatch available.")
+                uda_device = None
         else:
             uda_device = None
-        step_vals = algorithm.update(minibatches_device, uda_device)
-        checkpoint_vals['step_time'].append(time.time() - step_start_time)
 
+        # ---- Algorithm update ----
+        try:
+            step_vals = algorithm.update(minibatches_device, uda_device)
+        except Exception as e:
+            print(f">>> [ERROR] Algorithm update failed: {e}")
+            break
+
+        checkpoint_vals['step_time'].append(time.time() - step_start_time)
         for key, val in step_vals.items():
             checkpoint_vals[key].append(val)
 
-        if (step % checkpoint_freq == 0) or (step == n_steps - 1):
-            results = {
-                'step': step,
-                'epoch': step / steps_per_epoch,
-            }
+        # ---- Checkpointing & Evaluation every 100 steps ----
+        if (step % 100 == 0) or (step == n_steps - 1):
+            print(f">>> [DEBUG] Running evaluation at step {step}...")
 
+            results = {'step': step, 'epoch': step / steps_per_epoch}
             for key, val in checkpoint_vals.items():
                 results[key] = np.mean(val)
 
+            # ---- Evaluate on all environments ----
             evals = zip(eval_loader_names, eval_loaders, eval_weights)
             for name, loader, weights in evals:
                 acc = misc.accuracy(algorithm, loader, weights, device)
                 results[name+'_acc'] = acc
 
+            # ---- Log memory usage ----
             results['mem_gb'] = torch.cuda.max_memory_allocated() / (1024.*1024.*1024.)
+            print(f">>> [DEBUG] GPU Memory after evaluation: {results['mem_gb']:.2f} GB")
 
+            # ---- Print results table ----
             results_keys = sorted(results.keys())
             if results_keys != last_results_keys:
                 misc.print_row(results_keys, colwidth=12)
                 last_results_keys = results_keys
-            misc.print_row([results[key] for key in results_keys],
-                colwidth=12)
+            misc.print_row([results[key] for key in results_keys], colwidth=12)
 
-            results.update({
-                'hparams': hparams,
-                'args': vars(args)
-            })
-
+            # ---- Save results ----
+            results.update({'hparams': hparams, 'args': vars(args)})
             epochs_path = os.path.join(args.output_dir, 'results.jsonl')
             with open(epochs_path, 'a') as f:
                 f.write(json.dumps(results, sort_keys=True) + "\n")
 
+            # ---- Save checkpoint every 1000 steps ----
             algorithm_dict = algorithm.state_dict()
             start_step = step + 1
             checkpoint_vals = collections.defaultdict(lambda: [])
-
-            if args.save_model_every_checkpoint:
+            if (step % 1000 == 0 and step > 0) or args.save_model_every_checkpoint:
                 save_checkpoint(f'model_step{step}.pkl')
+                print(f">>> [DEBUG] Checkpoint model_step{step}.pkl saved.")
 
+    # ---- Final checkpoint ----
     save_checkpoint('model.pkl')
+    print(">>> [DEBUG] Final model checkpoint saved.")
 
+    # ---- Mark training done ----
     with open(os.path.join(args.output_dir, 'done'), 'w') as f:
         f.write('done')
+    print(">>> [DEBUG] Training completed successfully.")
