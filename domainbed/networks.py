@@ -1,13 +1,11 @@
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models
-
+from torchvision.models import resnet50
 from domainbed.lib import wide_resnet
 import copy
-
+import gc
 import timm
 
 
@@ -113,12 +111,37 @@ class ResNet(torch.nn.Module):
             self.network = torchvision.models.resnet18(pretrained=True)
             self.n_outputs = 512
         else:
-            self.network = torchvision.models.resnet50(pretrained=True)
+            # print(">> resnet-50 loading")
+            local_weights_path = "/content/resnet50-0676ba61.pth"  
+            state_dict = torch.load(local_weights_path)
+
+            self.network = resnet50(weights=None)  
+            self.network.load_state_dict(state_dict)
+            # print(">> resnet-50 loaded")
             self.n_outputs = 2048
 
         if hparams['resnet50_augmix']:
-            self.network = timm.create_model('resnet50.ram_in1k', pretrained=True)
-            self.n_outputs = 2048
+            # # gc.collect()
+            # # torch.cuda.empty_cache()
+            # print(">>> [DEBUG] Creating TIMM ResNet50...")
+            # try:
+            #     # Create TIMM ResNet50 model
+            #     self.network = timm.create_model('resnet50.ram_in1k', pretrained=False,weights_only=True)
+
+            #     # Load local checkpoint instead of downloading
+            #     ram_ckpt_path = "/content/resnet50_ram_in1k.pth"
+            #     state_dict = torch.load(ram_ckpt_path, map_location="cpu",)
+            #     print(f">>> [DEBUG] Loaded local RAM weights with {len(state_dict.keys())} keys")
+
+            #     # Load state dict
+            #     self.network.load_state_dict(state_dict, strict=False)
+            #     print(">>> [DEBUG] TIMM ResNet50 (RAM-In1k) loaded successfully!")
+
+            # except Exception as e:
+            #     print(">>> [ERROR] Failed to load TIMM RAM-In1k weights:", e)
+            # self.n_outputs = 2048
+            print(">>> [DEBUG] TIMM ResNet50 created successfully")
+
 
         # self.network = remove_batch_norm_from_resnet(self.network)
 
@@ -230,6 +253,8 @@ class ContextNet(nn.Module):
 
 def Featurizer(input_shape, hparams):
     """Auto-select an appropriate featurizer for the given input shape."""
+    # print(f">>> [DEBUG] Featurizer called with input_shape={input_shape}, hparams={hparams}")
+
     if len(input_shape) == 1:
         return MLP(input_shape[0], hparams["mlp_width"], hparams)
     elif input_shape[1:3] == (28, 28):
@@ -245,9 +270,12 @@ def Featurizer(input_shape, hparams):
         return ResNet(input_shape, hparams)
     else:
         raise NotImplementedError
+    # print(">>> [DEBUG] Featurizer returning model:", model.__class__.__name__)
+
 
 
 def Classifier(in_features, out_features, is_nonlinear=False):
+    # print(">>> [DEBUG] classifier returning model:")
     if is_nonlinear:
         return torch.nn.Sequential(
             torch.nn.Linear(in_features, in_features // 2),
