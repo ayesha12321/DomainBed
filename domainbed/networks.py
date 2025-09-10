@@ -184,6 +184,39 @@ class ResNet(torch.nn.Module):
             if isinstance(m, nn.BatchNorm2d):
                 m.eval()
 
+class SmallViT(nn.Module):
+    """ViT-Small feature extractor via timm"""
+    def __init__(self, input_shape, hparams):
+        super().__init__()
+        # Create the timm ViT-Small model (use pretrained weights by default)
+        self.network = timm.create_model('vit_small_patch16_224', pretrained=True)
+        self.n_outputs = self.network.embed_dim
+
+
+        # Ensure input has 3 channels (RGB)
+        if input_shape[0] != 3:
+            raise RuntimeError("ViT-Small requires 3-channel input")
+
+
+        # Optionally freeze the model for feature extraction
+        if not hparams.get('vit_finetune', True):
+            for p in self.network.parameters():
+                p.requires_grad = False
+
+
+        # Optional dropout for regularization
+        self.dropout = nn.Dropout(hparams.get('vit_dropout', 0.1))
+
+
+        print(">>> [DEBUG] vit small created successfully")
+
+
+    def forward(self, x):
+        # Extract features from the vision transformer
+        x = self.network.forward_features(x)  # [B, 197, D]
+        x = x[:, 0]                           # CLS token → [B, D]
+        x = self.dropout(x)
+        return x
 
 class MNIST_CNN(nn.Module):
     """
@@ -266,7 +299,7 @@ def Featurizer(input_shape, hparams):
             if hparams["dinov2"]:
                 return DinoV2(input_shape, hparams)
             else:
-                raise NotImplementedError
+                return SmallViT(input_shape, hparams)
         return ResNet(input_shape, hparams)
     else:
         raise NotImplementedError
