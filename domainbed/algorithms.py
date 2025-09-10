@@ -2947,15 +2947,155 @@ class ERM_Center_Lclsdir(Algorithm):
     def predict(self, x):
         return self.network(x)
 
+# class ERM_CenterTriplet_Lclsdir(Algorithm):
+#     """ERM + Center Loss + Triplet Loss + L_clsdir"""
+
+#     def __init__(self, input_shape, num_classes, num_domains, hparams):
+#         super().__init__(input_shape, num_classes, num_domains, hparams)
+
+#         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+#         self.num_classes = num_classes
+#         print(">>> [DEBUG] Initializing ERM_CenterTriplet_Lclsdir:")
+
+#         # Networks
+#         self.featurizer = networks.Featurizer(input_shape, hparams)
+#         self.classifier = networks.Classifier(
+#             self.featurizer.n_outputs,
+#             num_classes,
+#             hparams['nonlinear_classifier']
+#         )
+#         self.network = nn.Sequential(self.featurizer, self.classifier)
+
+#         # Loss functions
+#         self.center_loss_fn = CenterLoss(
+#             num_classes, self.featurizer.n_outputs, self.device,
+#             center_lr=hparams['center_update_lr']
+#         )
+#         self.triplet_loss_fn = losses.TripletMarginLoss(
+#             margin=hparams['triplet_margin']
+#         )
+#         self.miner = miners.TripletMarginMiner(
+#             margin=hparams['triplet_margin'], type_of_triplets="hard"
+#         )
+
+#         # λ values from hparams
+#         self.lambda_center = hparams['lambda_center']
+#         self.lambda_triplet = hparams['lambda_triplet']
+#         self.lambda_clsdir = hparams['lambda_clsdir']
+
+#         # Auto-tune setup
+#         self.auto_tune_steps = hparams['lambda_tune_steps']
+#         self.step_count = 0
+#         self.tuned = False
+
+#         # Optimizer
+#         self.optimizer = torch.optim.Adam(
+#             list(self.network.parameters()) + list(self.center_loss_fn.parameters()),
+#             lr=hparams["lr"],
+#             weight_decay=hparams['weight_decay']
+#         )
+
+#     def _grad_norm(self, loss):
+#         """Compute gradient norm for a loss term."""
+#         self.optimizer.zero_grad()
+#         loss.backward(retain_graph=True)
+#         total_norm = 0
+#         for p in self.network.parameters():
+#             if p.grad is not None:
+#                 param_norm = p.grad.data.norm(2)
+#                 total_norm += param_norm.item() ** 2
+#         return (total_norm ** 0.5) + 1e-8
+
+#     def l_cls_dir(self, features, labels):
+#         """Dynamic scatter matrix version of L_clsdir."""
+#         feat_dim = features.size(1)
+#         class_means = []
+#         for c in range(self.num_classes):
+#             mask = (labels == c)
+#             if mask.any():
+#                 class_means.append(features[mask].mean(0))
+#             else:
+#                 class_means.append(torch.zeros(feat_dim, device=self.device))
+#         class_means = torch.stack(class_means)
+#         class_means = F.normalize(class_means, p=2, dim=1)
+
+#         S_cls = class_means @ class_means.t()
+
+#         W = self.classifier.weight
+#         W_norm = F.normalize(W, p=2, dim=1)
+#         W_norm_t = W_norm.t()
+
+#         return -torch.trace(W_norm_t @ S_cls @ W_norm)
+
+#     def update(self, minibatches, unlabeled=None):
+#         self.step_count += 1
+#         all_x = torch.cat([x for x, y in minibatches])
+#         all_y = torch.cat([y for x, y in minibatches])
+
+#         # Forward pass
+#         features = self.featurizer(all_x)
+#         preds = self.classifier(features)
+
+#         # Loss components
+#         ce_loss = F.cross_entropy(preds, all_y)
+#         center_l = self.center_loss_fn(features, all_y)
+#         mined = self.miner(features, all_y)
+#         triplet_l = self.triplet_loss_fn(features, all_y, mined)
+#         clsdir_l = self.l_cls_dir(features, all_y)
+
+#         # Auto-tune λ values during warm-up
+#         if self.step_count <= self.auto_tune_steps and not self.tuned:
+#             ce_g = self._grad_norm(ce_loss)
+#             center_g = self._grad_norm(center_l)
+#             triplet_g = self._grad_norm(triplet_l)
+#             clsdir_g = self._grad_norm(clsdir_l)
+
+#             self.lambda_center = 0.5 * (ce_g / center_g)
+#             self.lambda_triplet = 0.5 * (ce_g / triplet_g)
+#             self.lambda_clsdir = 0.5 * (ce_g / clsdir_g)
+
+#             if self.step_count == self.auto_tune_steps:
+#                 self.tuned = True
+#                 print(f"[Auto-tune] λ_center={self.lambda_center:.4f}, "
+#                       f"λ_triplet={self.lambda_triplet:.4f}, λ_clsdir={self.lambda_clsdir:.4f}")
+
+#         # Final loss
+#         loss = (ce_loss +
+#                 self.lambda_center * center_l +
+#                 self.lambda_triplet * triplet_l +
+#                 self.lambda_clsdir * clsdir_l)
+
+#         # Backpropagation
+#         self.optimizer.zero_grad()
+#         loss.backward()
+#         self.optimizer.step()
+
+#         return {
+#             'loss': loss.item(),
+#             'ce_loss': ce_loss.item(),
+#             'center_loss': center_l.item(),
+#             'triplet_loss': triplet_l.item(),
+#             'cls_dir_loss': clsdir_l.item(),
+#             'lambda_center': self.lambda_center,
+#             'lambda_triplet': self.lambda_triplet,
+#             'lambda_clsdir': self.lambda_clsdir
+#         }
+
+#     def predict(self, x):
+#         return self.network(x)
+
 class ERM_CenterTriplet_Lclsdir(Algorithm):
-    """ERM + Center Loss + Triplet Loss + L_clsdir"""
+    """ERM + Center Loss + Triplet Loss + L_clsdir with continuous lambda adjustment."""
+
 
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super().__init__(input_shape, num_classes, num_domains, hparams)
 
+
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.num_classes = num_classes
         print(">>> [DEBUG] Initializing ERM_CenterTriplet_Lclsdir:")
+
 
         # Networks
         self.featurizer = networks.Featurizer(input_shape, hparams)
@@ -2966,6 +3106,7 @@ class ERM_CenterTriplet_Lclsdir(Algorithm):
         )
         self.network = nn.Sequential(self.featurizer, self.classifier)
 
+
         # Loss functions
         self.center_loss_fn = CenterLoss(
             num_classes, self.featurizer.n_outputs, self.device,
@@ -2975,18 +3116,28 @@ class ERM_CenterTriplet_Lclsdir(Algorithm):
             margin=hparams['triplet_margin']
         )
         self.miner = miners.TripletMarginMiner(
-            margin=hparams['triplet_margin'], type_of_triplets="hard"
+            margin=hparams['triplet_margin'], type_of_triplets="semihard"
         )
+
 
         # λ values from hparams
         self.lambda_center = hparams['lambda_center']
         self.lambda_triplet = hparams['lambda_triplet']
         self.lambda_clsdir = hparams['lambda_clsdir']
 
-        # Auto-tune setup
+
+        # Auto-tune & update
         self.auto_tune_steps = hparams['lambda_tune_steps']
         self.step_count = 0
-        self.tuned = False
+        self.lambda_momentum = 0.9  # smoothing factor for continuous updates
+
+
+        # Internal local variables (not in hyperparams)
+        self.warmup_aux_steps = 200
+        self.lambda_ramp_steps = 1000
+        self.grad_clip_value = 2.0
+        self.clsdir_scale = 1.0
+
 
         # Optimizer
         self.optimizer = torch.optim.Adam(
@@ -2994,6 +3145,7 @@ class ERM_CenterTriplet_Lclsdir(Algorithm):
             lr=hparams["lr"],
             weight_decay=hparams['weight_decay']
         )
+
 
     def _grad_norm(self, loss):
         """Compute gradient norm for a loss term."""
@@ -3005,6 +3157,7 @@ class ERM_CenterTriplet_Lclsdir(Algorithm):
                 param_norm = p.grad.data.norm(2)
                 total_norm += param_norm.item() ** 2
         return (total_norm ** 0.5) + 1e-8
+
 
     def l_cls_dir(self, features, labels):
         """Dynamic scatter matrix version of L_clsdir."""
@@ -3019,56 +3172,99 @@ class ERM_CenterTriplet_Lclsdir(Algorithm):
         class_means = torch.stack(class_means)
         class_means = F.normalize(class_means, p=2, dim=1)
 
-        S_cls = class_means @ class_means.t()
 
+        S_cls = class_means @ class_means.t()
         W = self.classifier.weight
         W_norm = F.normalize(W, p=2, dim=1)
         W_norm_t = W_norm.t()
+        return -self.clsdir_scale * torch.trace(W_norm_t @ S_cls @ W_norm)
 
-        return -torch.trace(W_norm_t @ S_cls @ W_norm)
 
     def update(self, minibatches, unlabeled=None):
         self.step_count += 1
         all_x = torch.cat([x for x, y in minibatches])
         all_y = torch.cat([y for x, y in minibatches])
 
+
         # Forward pass
         features = self.featurizer(all_x)
+        features = F.normalize(features, p=2, dim=1)   # normalized features
         preds = self.classifier(features)
 
-        # Loss components
+
         ce_loss = F.cross_entropy(preds, all_y)
+
+
+        # Auxiliary losses
         center_l = self.center_loss_fn(features, all_y)
-        mined = self.miner(features, all_y)
-        triplet_l = self.triplet_loss_fn(features, all_y, mined)
+        try:
+            mined = self.miner(features, all_y)
+            triplet_l = self.triplet_loss_fn(features, all_y, mined)
+        except Exception:
+            triplet_l = torch.tensor(0.0, device=features.device)
+
+
         clsdir_l = self.l_cls_dir(features, all_y)
 
-        # Auto-tune λ values during warm-up
-        if self.step_count <= self.auto_tune_steps and not self.tuned:
+
+        # Continuous lambda adjustment (smooth)
+        if self.step_count > self.warmup_aux_steps:
             ce_g = self._grad_norm(ce_loss)
-            center_g = self._grad_norm(center_l)
-            triplet_g = self._grad_norm(triplet_l)
-            clsdir_g = self._grad_norm(clsdir_l)
+            center_g = max(self._grad_norm(center_l), 1e-12)
+            triplet_g = max(self._grad_norm(triplet_l), 1e-12)
+            clsdir_g = max(self._grad_norm(clsdir_l), 1e-12)
 
-            self.lambda_center = 0.5 * (ce_g / center_g)
-            self.lambda_triplet = 0.5 * (ce_g / triplet_g)
-            self.lambda_clsdir = 0.5 * (ce_g / clsdir_g)
 
-            if self.step_count == self.auto_tune_steps:
-                self.tuned = True
-                print(f"[Auto-tune] λ_center={self.lambda_center:.4f}, "
-                      f"λ_triplet={self.lambda_triplet:.4f}, λ_clsdir={self.lambda_clsdir:.4f}")
+            # compute new lambda ratios
+            lambda_center_new = 0.25 * (ce_g / max(center_g, 1e-12)) * (center_l.item() / ce_loss.item())
+            lambda_triplet_new = 0.25 * (ce_g / max(triplet_g, 1e-12)) * (triplet_l.item() / ce_loss.item())
+            lambda_clsdir_new = 0.25 * (ce_g / max(clsdir_g, 1e-12)) * (clsdir_l.item() / ce_loss.item())
+           
+            if (abs(lambda_center_new - self.lambda_center) > 1e-5 or
+              abs(lambda_triplet_new - self.lambda_triplet) > 1e-5 or
+              abs(lambda_clsdir_new - self.lambda_clsdir) > 1e-5):
+              print(f"[Step {self.step_count}] λ_center={lambda_center_new:.6f}, "
+                    f"λ_triplet={lambda_triplet_new:.6f}, λ_clsdir={lambda_clsdir_new:.6f}")
 
-        # Final loss
-        loss = (ce_loss +
-                self.lambda_center * center_l +
-                self.lambda_triplet * triplet_l +
-                self.lambda_clsdir * clsdir_l)
 
-        # Backpropagation
+            # momentum update
+            self.lambda_center = self.lambda_momentum * self.lambda_center + (1 - self.lambda_momentum) * lambda_center_new
+            self.lambda_triplet = self.lambda_momentum * self.lambda_triplet + (1 - self.lambda_momentum) * lambda_triplet_new
+            self.lambda_clsdir = self.lambda_momentum * self.lambda_clsdir + (1 - self.lambda_momentum) * lambda_clsdir_new
+
+
+            # clamp to safe range
+            self.lambda_center = float(max(1e-4, min(self.lambda_center, 0.1)))
+            self.lambda_triplet = float(max(1e-4, min(self.lambda_triplet, 0.1)))
+            self.lambda_clsdir = float(max(1e-4, min(self.lambda_clsdir, 0.1)))
+
+
+        # Ramp auxiliary losses
+        if self.step_count <= self.warmup_aux_steps:
+            loss = ce_loss
+            effective_lambda_center = 0.0
+            effective_lambda_triplet = 0.0
+            effective_lambda_clsdir = 0.0
+        else:
+            ramp_step = min(self.step_count - self.warmup_aux_steps, self.lambda_ramp_steps)
+            ramp_frac = ramp_step / float(max(1, self.lambda_ramp_steps))
+            effective_lambda_center = ramp_frac * self.lambda_center
+            effective_lambda_triplet = ramp_frac * self.lambda_triplet
+            effective_lambda_clsdir = ramp_frac * self.lambda_clsdir
+
+
+            loss = (ce_loss +
+                    effective_lambda_center * center_l +
+                    effective_lambda_triplet * triplet_l +
+                    effective_lambda_clsdir * clsdir_l)
+
+
+        # Backprop with gradient clipping
         self.optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.grad_clip_value)
         self.optimizer.step()
+
 
         return {
             'loss': loss.item(),
@@ -3081,8 +3277,11 @@ class ERM_CenterTriplet_Lclsdir(Algorithm):
             'lambda_clsdir': self.lambda_clsdir
         }
 
+
     def predict(self, x):
-        return self.network(x)
+        with torch.no_grad():
+            return self.network(x)
+
 
 
 class ERMPlusPlus(Algorithm,ErmPlusPlusMovingAvg):
