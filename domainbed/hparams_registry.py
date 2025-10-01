@@ -325,9 +325,17 @@ def _hparams(algorithm, dataset, random_seed):
       _hparam('lambda_center', 0.1, lambda r: r.uniform(0.01, 1.0))
       _hparam('center_update_lr', 0.5, lambda r: r.uniform(0.01, 1.0))
 
+    elif algorithm == "ERM_Triplet":
+      
+      _hparam('lambda_triplet',0.1, lambda r: r.uniform(0.05, 1.0))
+      _hparam('triplet_margin',0.3, lambda r: r.uniform(0.1, 1.0))
+
+      _hparam('lambda_tune_steps',100, lambda r: int(r.uniform(50, 200)))
+
+      _hparam('mlp_dropout',0.0, lambda r: r.uniform(0., 0.5))
+
     elif algorithm == "ERM_CenterTriplet":
       
-
       _hparam('lambda_center',0.1, lambda r: r.uniform(0.05, 1.0))
       _hparam('center_update_lr',0.5, lambda r: r.uniform(0.1, 1.0))
 
