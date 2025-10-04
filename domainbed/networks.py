@@ -108,17 +108,30 @@ class ResNet(torch.nn.Module):
     def __init__(self, input_shape, hparams):
         super(ResNet, self).__init__()
         if hparams['resnet18']:
-            self.network = torchvision.models.resnet18(pretrained=True)
+            print("Loading Resnet18")
+            if hparams['resnet18_pretrained']:
+                print(">> resnet-18 loading pretrained")
+                self.network = torchvision.models.resnet18(weights = torchvision.models.ResNet18_Weights.DEFAULT)
+            else:
+                print(">> resnet-18 loading untrained")
+            self.network = torchvision.models.resnet18(weights = None)
             self.n_outputs = 512
         else:
             # print(">> resnet-50 loading")
-            local_weights_path = "/content/resnet50-0676ba61.pth"  
-            state_dict = torch.load(local_weights_path)
+            if hparams['resnet50_pretrained']:
+                print(">> resnet-50 loading pretrained")
+                self.network = torchvision.models.resnet50(weights = torchvision.models.ResNet50_Weights.DEFAULT)
+                self.n_outputs = 2048
+                
+            else:
+                print(">> resnet-50 loaded weights")
+                local_weights_path = "/content/resnet50-0676ba61.pth"  
+                state_dict = torch.load(local_weights_path)
 
-            self.network = resnet50(weights=None)  
-            self.network.load_state_dict(state_dict)
-            # print(">> resnet-50 loaded")
-            self.n_outputs = 2048
+                self.network = resnet50(weights=None)  
+                self.network.load_state_dict(state_dict)
+                # print(">> resnet-50 loaded")
+                self.n_outputs = 2048
 
         if hparams['resnet50_augmix']:
             # # gc.collect()

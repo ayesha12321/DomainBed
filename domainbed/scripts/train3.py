@@ -14,6 +14,7 @@ import PIL
 import torch
 import torchvision
 import torch.utils.data
+import matplotlib.pyplot as plt
 
 from domainbed import datasets
 from domainbed import hparams_registry
@@ -94,6 +95,8 @@ if __name__ == "__main__":
         device = "cuda"
     else:
         device = "cpu"
+
+    print(device)
 
     if args.dataset in vars(datasets):
         dataset = vars(datasets)[args.dataset](args.data_dir,
@@ -183,6 +186,10 @@ if __name__ == "__main__":
     uda_minibatches_iterator = zip(*uda_loaders)
     checkpoint_vals = collections.defaultdict(lambda: [])
 
+        # For plotting
+    train_losses = []
+    train_steps = []
+
     steps_per_epoch = min([len(env)/hparams['batch_size'] for env,_ in in_splits])
 
     n_steps = args.steps or dataset.N_STEPS
@@ -239,8 +246,13 @@ if __name__ == "__main__":
         for key, val in step_vals.items():
             checkpoint_vals[key].append(val)
 
+                # store loss for curve
+        if "loss" in step_vals:
+            train_losses.append(step_vals["loss"])
+            train_steps.append(step)
+
         # ---- Checkpointing & Evaluation every 100 steps ----
-        if (step % 100 == 0) or (step == n_steps - 1):
+        if (step % 1000 == 0) or (step == n_steps - 1):
             print(f">>> [DEBUG] Running evaluation at step {step}...")
 
             results = {'step': step, 'epoch': step / steps_per_epoch}
@@ -274,7 +286,7 @@ if __name__ == "__main__":
             algorithm_dict = algorithm.state_dict()
             start_step = step + 1
             checkpoint_vals = collections.defaultdict(lambda: [])
-            if (step % 1000 == 0 and step > 0) or args.save_model_every_checkpoint:
+            if (step % 1000 == 0 and step > 0 ) or args.save_model_every_checkpoint or (step == n_steps - 1):
                 save_checkpoint(f'model_step{step}.pkl')
                 print(f">>> [DEBUG] Checkpoint model_step{step}.pkl saved.")
 
@@ -282,7 +294,19 @@ if __name__ == "__main__":
     save_checkpoint('model.pkl')
     print(">>> [DEBUG] Final model checkpoint saved.")
 
-    # ---- Mark training done ----
+# ---- Plot final training loss curve ----
+    if len(train_losses) > 0:
+        plt.figure(figsize=(8, 5))
+        plt.plot(train_steps, train_losses, label="Train Loss")
+        plt.xlabel("Step")
+        plt.ylabel("Loss")
+        plt.title("Final Training Loss Curve")
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(args.output_dir, "final_loss_curve.png"))
+        plt.close()
+        print(f">>> [DEBUG] Final loss curve saved to {os.path.join(args.output_dir, 'final_loss_curve.png')}")
+
     with open(os.path.join(args.output_dir, 'done'), 'w') as f:
         f.write('done')
     print(">>> [DEBUG] Training completed successfully.")
