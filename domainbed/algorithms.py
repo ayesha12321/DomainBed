@@ -2724,21 +2724,51 @@ class ERM_CenterLoss(Algorithm):
             weight_decay=hparams['weight_decay']
         )
 
+        self.lambda_center = hparams['lambda_center']
+        self.step_count = 0
+
+    def _grad_norm(self, loss):
+        """Compute gradient norm for balancing."""
+        self.optimizer.zero_grad()
+        loss.backward(retain_graph=True)
+        total_norm = 0
+        for p in self.network.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        return (total_norm ** 0.5) + 1e-8  # avoid div0
+
     def update(self, minibatches, unlabeled=None):
+        
+        self.step_count += 1
+
         all_x = torch.cat([x for x, y in minibatches])
         all_y = torch.cat([y for x, y in minibatches])
 
         features = self.featurizer(all_x)
         preds = self.classifier(features)
         ce_loss = F.cross_entropy(preds, all_y)
-        c_loss = self.center_loss_fn(features, all_y) * self.hparams['lambda_center']
+        c_loss = self.center_loss_fn(features, all_y)
 
-        loss = ce_loss + c_loss
+        if self.step_count % 1000 == 0:
+            ce_g = self._grad_norm(ce_loss)
+            center_g = self._grad_norm(c_loss)
+
+            self.lambda_center = 0.5 * (ce_g / center_g)
+            print(f"[Auto-tune] Step {self.step_count}: λ_center={self.lambda_center:.4f}")
+
+        loss = ce_loss + self.lambda_center * c_loss
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
-        return {'loss': loss.item(), 'ce_loss': ce_loss.item(), 'center_loss': c_loss.item()}
+        return {
+            'loss': loss.item(),
+            'ce_loss': ce_loss.item(),
+            'center_loss': c_loss.item(),
+            'lambda_center': self.lambda_center
+        }
+
 
     def predict(self, x):
         return self.network(x)
@@ -2805,9 +2835,7 @@ class ERM_Triplet(Algorithm):
             triplet_g = self._grad_norm(triplet_l)
 
             self.lambda_triplet = 0.5 * (ce_g / triplet_g)
-
-            if self.step_count == self.auto_tune_steps:
-                print(f"[Auto-tune] λ_triplet={self.lambda_triplet:.4f}")
+            print(f"[Auto-tune] λ_triplet={self.lambda_triplet:.4f}")
 
         loss = ce_loss + self.lambda_triplet * triplet_l
         self.optimizer.zero_grad()
@@ -2956,8 +2984,7 @@ class ERM_Triplet_random(Algorithm):
             ce_g = self._grad_norm(ce_loss)
             triplet_g = self._grad_norm(triplet_l) if triplet_l.item() > 0 else 1e-8
             self.lambda_triplet = 0.5 * (ce_g / triplet_g)
-            if self.step_count == self.auto_tune_steps:
-                print(f"[Auto-tune] λ_triplet={self.lambda_triplet:.4f}")
+            print(f"[Auto-tune] λ_triplet={self.lambda_triplet:.4f}")
         
         loss = ce_loss + self.lambda_triplet * triplet_l
         self.optimizer.zero_grad()
@@ -3035,17 +3062,14 @@ class ERM_CenterTriplet(Algorithm):
         triplet_l = self.triplet_loss_fn(features, all_y, mined)
 
         # Auto-tune λ in warm-up
-        if self.step_count <= self.auto_tune_steps and not self.tuned:
+        if self.step_count % 1000 == 0:
             ce_g = self._grad_norm(ce_loss)
             center_g = self._grad_norm(center_l)
             triplet_g = self._grad_norm(triplet_l)
 
             self.lambda_center = 0.5 * (ce_g / center_g)
             self.lambda_triplet = 0.5 * (ce_g / triplet_g)
-
-            if self.step_count == self.auto_tune_steps:
-                self.tuned = True
-                print(f"[Auto-tune] λ_center={self.lambda_center:.4f}, λ_triplet={self.lambda_triplet:.4f}")
+            print(f"[Auto-tune] λ_center={self.lambda_center:.4f}, λ_triplet={self.lambda_triplet:.4f}")
 
         loss = ce_loss + self.lambda_center * center_l + self.lambda_triplet * triplet_l
         self.optimizer.zero_grad()
