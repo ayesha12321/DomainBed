@@ -15,6 +15,7 @@ import torch
 import torchvision
 import torch.utils.data
 import matplotlib.pyplot as plt
+from torch.utils.data import ConcatDataset
 
 from domainbed import datasets
 from domainbed import hparams_registry
@@ -49,6 +50,9 @@ if __name__ == "__main__":
         help="For domain adaptation, % of test to use unlabeled for training.")
     parser.add_argument('--skip_model_save', action='store_true')
     parser.add_argument('--save_model_every_checkpoint', action='store_true')
+    parser.add_argument('--train_domains', type=int, nargs='+')
+    parser.add_argument('--load_model', type=str, default=None,
+                    help="Path to a model.pkl file to load weights from before training.")
     args = parser.parse_args()
 
     # If we ever want to implement checkpointing, just persist these values
@@ -143,6 +147,15 @@ if __name__ == "__main__":
         if len(uda):
             uda_splits.append((uda, uda_weights))
 
+    if args.train_domains:
+        # This block activates only when training a specialist.
+        # It filters the in_splits to keep only the desired training domain.
+        filtered_in_splits = []
+        for i, (env, env_weights) in enumerate(in_splits):
+            if i in args.train_domains:
+                filtered_in_splits.append((env, env_weights))
+        in_splits = filtered_in_splits
+
     if args.task == "domain_adaptation" and len(uda_splits) == 0:
         raise ValueError("Not enough unlabeled samples for domain adaptation.")
 
@@ -182,6 +195,14 @@ if __name__ == "__main__":
 
     algorithm.to(device)
     
+    if args.load_model:
+        try:
+            loaded_dict = torch.load(args.load_model)
+            algorithm.load_state_dict(loaded_dict['model_dict'])
+            print(f">>> [INFO] Loaded pre-trained weights from: {args.load_model}")
+        except Exception as e:
+            print(f">>> [ERROR] Could not load model from {args.load_model}: {e}")
+
     train_minibatches_iterator = zip(*train_loaders)
     uda_minibatches_iterator = zip(*uda_loaders)
     checkpoint_vals = collections.defaultdict(lambda: [])
