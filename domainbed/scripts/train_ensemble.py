@@ -33,10 +33,8 @@ if __name__ == '__main__':
     print("-" * 30)
 
     # --- Define Hyperparameters ---
-    # Generalist: Pre-trained on ImageNet with a standard learning rate.
     gen_hparams_str = '{"batch_size": 8, "resnet18": true, "resnet50_augmix": false, "resnet18_pretrained": true, "lr": 5e-4}'
-    
-    # Specialist: Lower learning rate for stable fine-tuning.
+
     sp_hparams_str = '{"batch_size": 8, "resnet18": true, "resnet50_augmix": false, "resnet18_pretrained": true, "lr": 5e-4}'
     sp_steps = 501  # Fine-tune for a smaller number of steps (e.g., one epoch).
 
