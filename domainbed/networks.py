@@ -111,7 +111,7 @@ class ResNet(torch.nn.Module):
             print("Loading Resnet18")
             if hparams['resnet18_pretrained']:
                 print(">> resnet-18 loading pretrained")
-                self.network = torchvision.models.resnet18(weights = torchvision.models.ResNet18_Weights.DEFAULT)
+                self.network = torchvision.models.resnet18(weights='IMAGENET1K_V1')
             else:
                 print(">> resnet-18 loading untrained")
             self.network = torchvision.models.resnet18(weights = None)
