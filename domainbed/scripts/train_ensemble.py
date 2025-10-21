@@ -50,7 +50,7 @@ if __name__ == '__main__':
         '--algorithm', args.algorithm,
         '--test_envs', str(final_test_env),
         '--output_dir', generalist_output_dir,
-        '--holdout_fraction', '0.1',
+        '--holdout_fraction', '0.2',
         '--hparams', gen_hparams_str
     ]
     subprocess.run(generalist_command, input='y\n', text=True)
@@ -74,6 +74,7 @@ if __name__ == '__main__':
             '--output_dir', specialist_output_dir,
             '--hparams', sp_hparams_str,
             '--steps', str(sp_steps),
+            '--holdout_fraction', '0.2',
             '--load_model', generalist_model_path  # <-- Key: Load the generalist's weights
         ]
         subprocess.run(specialist_command, input='y\n', text=True)
