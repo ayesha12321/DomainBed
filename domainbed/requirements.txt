@@ -1,11 +1,17 @@
-torch==1.12.1
-torchvision==0.13.1
-backpack-for-pytorch==1.3.0
-numpy==1.22.4
-wilds==2.0.0
+# Core torch versions (compatible with CUDA 12.1 runtime)
+torch==2.2.2
+torchvision==0.17.2
+torchaudio==2.2.2
+
+# Core utilities
+numpy==1.26.4
 tqdm==4.66.4
-imageio==2.9.0
-gdown==3.13.0
-parameterized==0.9.0
 Pillow==10.3.0
+imageio==2.34.0
+gdown==5.1.0
+parameterized==0.9.0
+
+# DomainBed-specific deps
+backpack-for-pytorch==1.6.0
+wilds==2.0.0
 timm==0.9.16

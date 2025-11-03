@@ -2657,7 +2657,9 @@ class Algorithm(torch.nn.Module):
 import torch
 import os
 from domainbed.lib import misc
+<<<<<<< HEAD
 from domainbed import networks
+from domainbed.lib.fast_data_loader import FastDataLoader
 
 class ERMGeneralistHeadOnly(Algorithm):
     """
@@ -3001,15 +3003,21 @@ class HybridEnsembleMultiHead(Algorithm):
             batch_results.append(result)
 
         return batch_results
+=======
+
+>>>>>>> f17227e8f8386bb6672a1a30fdf788f3f43b832d
 
 class HybridEnsemble(Algorithm):
     """
-    An inference-only algorithm with a configurable, multi-level
-    ensemble logic.
+    Extended Hybrid Ensemble with dynamic domain relevance weighting.
+    Modes supported:
+      - confidence: weight by confidence
+      - entropy: weight by inverse entropy
+      - domain: use fixed domain relevance priors
+      - domain_dynamic: dynamically compute per-sample relevance
     """
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(HybridEnsemble, self).__init__(input_shape, num_classes, num_domains, hparams)
-        
         self.network = torch.nn.Identity()
         self.optimizer = None
 
@@ -3022,6 +3030,7 @@ class HybridEnsemble(Algorithm):
             classifier = networks.Classifier(featurizer.n_outputs, num_classes, hparams['nonlinear_classifier'])
             return torch.nn.Sequential(featurizer, classifier)
 
+        # --- Load generalist ---
         generalist_path = os.path.join(model_path_root, 'generalist', 'model.pkl')
         gen_model = create_new_network()
         loaded_state_dict = torch.load(generalist_path, map_location="cpu")['model_dict']
@@ -3029,6 +3038,7 @@ class HybridEnsemble(Algorithm):
         gen_model.load_state_dict(network_state_dict)
         self.models['generalist'] = gen_model.eval()
 
+        # --- Load specialists ---
         self.source_domains = []
         num_total_domains = 4
         for d in range(num_total_domains):
@@ -3040,21 +3050,92 @@ class HybridEnsemble(Algorithm):
                 network_state_dict = {k.replace("network.", "", 1): v for k, v in loaded_state_dict.items() if k.startswith("network.")}
                 spec_model.load_state_dict(network_state_dict)
                 self.models[f'specialist_{d}'] = spec_model.eval()
-        
+
         print(f"HybridEnsemble initialized. Loaded {len(self.models)} models.")
-        
+
         self.CONFIDENCE_THRESHOLD = hparams.get('confidence_thresh', 0.85)
         self.fallback_model = hparams.get('fallback_model', 'specialist_2')
         self.consensus_mode = hparams.get('consensus_mode', 'majority')
-        self.specialist_mode = hparams.get('specialist_mode', 'voting')
+        self.specialist_mode = hparams.get('specialist_mode', 'weighting')
+        self.weighting_mode = hparams.get('weighting_mode', 'confidence')  # confidence / entropy / domain / domain_dynamic
+        self.domain_relevance = hparams.get('domain_relevance', {0: 1.0, 1: 1.0, 2: 1.0})
+
+        # --- Precompute domain centroids for dynamic relevance ---
+        self.domain_centroids = {}
+        centroid_path = os.path.join(model_path_root, "domain_centroids.pt")
+        if self.weighting_mode == "domain_dynamic":
+            if os.path.exists(centroid_path):
+                print(">> Loading precomputed domain centroids")
+                self.domain_centroids = torch.load(centroid_path)
+            else:
+                print(">> Computing approximate domain centroids (may take time on first run)...")
+                self._compute_domain_centroids(
+                    hparams['data_dir'], hparams['dataset'], test_env, hparams
+                )
+
+    def _compute_domain_centroids(self, data_dir, dataset_name, test_env, hparams):
+        """
+        Compute domain centroids using IN-SPLIT data (training domains only).
+        Each centroid is the mean feature vector of all samples in that domain,
+        computed using the generalist featurizer.
+        """
+        from domainbed import datasets, misc
+        from domainbed.lib.fast_data_loader import FastDataLoader
+        import torch.nn.functional as F
+
+        featurizer = self.models['generalist'][0]
+        featurizer.eval()
+
+        # Create dataset and splits
+        dataset_class = getattr(datasets, dataset_name)
+        dataset = dataset_class(data_dir, [test_env], hparams)
+        centroids = {}
+
+        print(f">> Building centroids for training domains (excluding test env {test_env})...")
+
+        # Split dataset into in/out splits
+        for env_i, env in enumerate(dataset):
+            if env_i == test_env:
+                continue  # Skip test environment
+            loader = FastDataLoader(env, batch_size=32, num_workers=2)
+            feats = []
+            with torch.no_grad():
+                for x, _ in loader:
+                    x = x.to(next(featurizer.parameters()).device)
+                    feat = featurizer(x)
+                    feat = F.normalize(feat, dim=1)
+                    feats.append(feat.cpu())
+            if feats:
+                feats = torch.cat(feats, dim=0)
+                centroids[env_i] = feats.mean(dim=0)
+                print(f"  >> Domain {env_i}: computed centroid of shape {centroids[env_i].shape}")
+
+        self.domain_centroids = centroids
+        torch.save(self.domain_centroids, os.path.join(hparams['model_path_root'], "domain_centroids.pt"))
+        print(">> Domain centroids saved successfully.")
 
     def to(self, device):
         for name, model in self.models.items():
             self.models[name] = model.to(device)
+        for k, v in self.domain_centroids.items():
+            self.domain_centroids[k] = v.to(device)
         return self
 
-    def update(self, minibatches, unlabeled=None):
-        return {'loss': 0.0}
+    def _entropy(self, probs):
+        return -torch.sum(probs * torch.log(probs + 1e-12), dim=1)
+
+    def _compute_dynamic_relevance(self, x):
+        """Compute per-sample relevance to each source domain based on feature similarity."""
+        featurizer = self.models['generalist'][0]
+        feats = featurizer(x)
+        weights = []
+        for d in self.source_domains:
+            centroid = self.domain_centroids[d]
+            dist = torch.norm(feats - centroid.unsqueeze(0), dim=1)
+            weights.append(torch.exp(-dist))  # closer => higher weight
+        weights = torch.stack(weights, dim=1)
+        weights = weights / weights.sum(dim=1, keepdim=True)
+        return weights
 
     def predict(self, x):
         softmax_outputs = {}
@@ -3064,80 +3145,198 @@ class HybridEnsemble(Algorithm):
                 softmax_outputs[name] = torch.softmax(logits, dim=1)
 
         batch_size = x.shape[0]
-        batch_results = []
+        results = []
         gen_softmax = softmax_outputs['generalist']
         gen_confs, gen_preds = torch.max(gen_softmax, dim=1)
-        
+
+        dynamic_relevance = None
+        if self.weighting_mode == 'domain_dynamic':
+            dynamic_relevance = self._compute_dynamic_relevance(x)
+
         for i in range(batch_size):
             result = {'gen_pred': gen_preds[i].item(), 'gen_confidence': gen_confs[i].item()}
-            
+
             if gen_confs[i] > self.CONFIDENCE_THRESHOLD:
                 result.update({'final_pred': gen_preds[i].item(), 'reason': 'GENERALIST_HIGH_CONFIDENCE'})
-            
             else:
-                poll_details = [{'domain': d, 'vote': torch.argmax(softmax_outputs[f'specialist_{d}'][i]).item(), 'conf': torch.max(softmax_outputs[f'specialist_{d}'][i]).item(), 'softmax': softmax_outputs[f'specialist_{d}'][i]} for d in self.source_domains]
-                
-                if self.specialist_mode == 'voting':
-                    from collections import Counter
-                    specialist_votes = [d['vote'] for d in poll_details]
-                    all_votes = specialist_votes + [result['gen_pred']]
-                    vote_counts = Counter(all_votes)
-                    most_common_vote = vote_counts.most_common(1)[0]
-                    consensus_pred, num_votes = most_common_vote[0], most_common_vote[1]
+                poll_details = []
+                for d in self.source_domains:
+                    soft = softmax_outputs[f'specialist_{d}'][i]
+                    vote = torch.argmax(soft).item()
+                    conf = torch.max(soft).item()
+                    poll_details.append({'domain': d, 'vote': vote, 'conf': conf, 'softmax': soft})
 
-                    if num_votes == 4:
-                        result.update({'final_pred': consensus_pred, 'reason': 'UNANIMOUS_CONSENSUS (4/4 agree)', 'gen_softmax': gen_softmax[i].cpu().numpy(), 'spec_poll_details': poll_details})
-                    elif self.consensus_mode == 'majority' and num_votes == 3:
-                        result.update({'final_pred': consensus_pred, 'reason': 'MAJORITY_CONSENSUS (3/4 agree)', 'gen_softmax': gen_softmax[i].cpu().numpy(), 'spec_poll_details': poll_details})
+                if self.specialist_mode == 'weighting':
+                    if self.weighting_mode == 'confidence':
+                        all_weights = [d['conf'] for d in poll_details] + [gen_confs[i].item()]
+                    elif self.weighting_mode == 'entropy':
+                        all_entropies = [self._entropy(d['softmax'].unsqueeze(0))[0].item() for d in poll_details]
+                        gen_entropy = self._entropy(gen_softmax[i].unsqueeze(0))[0].item()
+                        all_weights = [1 / (e + 1e-6) for e in all_entropies] + [1 / (gen_entropy + 1e-6)]
+                    elif self.weighting_mode == 'domain':
+                        all_weights = [d['conf'] * self.domain_relevance.get(d['domain'], 1.0)
+                                       for d in poll_details] + [gen_confs[i].item()]
+                    elif self.weighting_mode == 'domain_dynamic':
+                        dyn_w = dynamic_relevance[i]
+                        all_weights = [d['conf'] * dyn_w[k].item() for k, d in enumerate(poll_details)] + [gen_confs[i].item()]
                     else:
-                        fallback_pred, reason = -1, ""
-                        if self.fallback_model == 'erm':
-                            fallback_pred, reason = result['gen_pred'], 'FALLBACK_TO_GENERALIST (No consensus)'
-                        else:
-                            fallback_domain_idx = int(self.fallback_model.split('_')[-1])
-                            specialist = next(d for d in poll_details if d['domain'] == fallback_domain_idx)
-                            fallback_pred, reason = specialist['vote'], f'FALLBACK_TO_SPECIALIST_{fallback_domain_idx} (No consensus)'
-                        result.update({'final_pred': fallback_pred, 'reason': reason, 'gen_softmax': gen_softmax[i].cpu().numpy(), 'spec_poll_details': poll_details})
+                        raise ValueError(f"Invalid weighting_mode: {self.weighting_mode}")
 
-                elif self.specialist_mode == 'weighting':
-                    # --- THIS IS THE NEW LOGIC ---
-                    # First, count the votes from all 4 models to determine the sub-reason
-                    from collections import Counter
-                    specialist_votes = [d['vote'] for d in poll_details]
-                    all_votes = specialist_votes + [result['gen_pred']]
-                    vote_counts = Counter(all_votes)
-                    most_common_vote = vote_counts.most_common(1)[0]
-                    num_votes = most_common_vote[1]
-
-                    reason = ""
-                    if num_votes == 4:
-                        reason = 'WEIGHTED_AVG (4/4 Agreed)'
-                    elif num_votes == 3:
-                        reason = 'WEIGHTED_AVG (3/4 Agreed)'
-                    elif num_votes == 2:
-                        reason = 'WEIGHTED_AVG (2/4 Tie)'
-                    else:
-                        reason = 'WEIGHTED_AVG (No Consensus)'
-                    # ------------------------------------
-
-                    all_models_confs = [d['conf'] for d in poll_details] + [gen_confs[i].item()]
-                    confs_tensor = torch.tensor(all_models_confs, device=x.device)
-                    weights = confs_tensor / confs_tensor.sum()
+                    weights = torch.tensor(all_weights, device=x.device)
+                    weights = weights / weights.sum()
 
                     blended_softmax = torch.zeros_like(poll_details[0]['softmax'])
-                    # Add specialists' weighted softmaxes
                     for idx, detail in enumerate(poll_details):
                         blended_softmax += detail['softmax'] * weights[idx]
-                    # Add the generalist's weighted softmax
                     blended_softmax += gen_softmax[i] * weights[-1]
-                    # -----------------------
 
                     final_pred = torch.argmax(blended_softmax).item()
-                    result.update({'final_pred': final_pred, 'reason': reason, 'gen_softmax': gen_softmax[i].cpu().numpy(), 'spec_poll_details': poll_details, 'blended_softmax': blended_softmax.cpu().numpy()})
-            
-            batch_results.append(result)
+                    reason = f"{self.weighting_mode.upper()}_WEIGHTING"
+                    result.update({
+                        'final_pred': final_pred,
+                        'reason': reason,
+                        'weights': weights.cpu().numpy(),
+                        'gen_softmax': gen_softmax[i].cpu().numpy(),
+                        'spec_poll_details': poll_details
+                    })
+            results.append(result)
+        return results
+# class HybridEnsemble(Algorithm):
+#     """
+#     An inference-only algorithm with a configurable, multi-level
+#     ensemble logic.
+#     """
+#     def __init__(self, input_shape, num_classes, num_domains, hparams):
+#         super(HybridEnsemble, self).__init__(input_shape, num_classes, num_domains, hparams)
+        
+#         self.network = torch.nn.Identity()
+#         self.optimizer = None
 
-        return batch_results
+#         self.models = {}
+#         model_path_root = hparams['model_path_root']
+#         test_env = hparams['test_env']
+
+#         def create_new_network():
+#             featurizer = networks.Featurizer(input_shape, hparams)
+#             classifier = networks.Classifier(featurizer.n_outputs, num_classes, hparams['nonlinear_classifier'])
+#             return torch.nn.Sequential(featurizer, classifier)
+
+#         generalist_path = os.path.join(model_path_root, 'generalist', 'model.pkl')
+#         gen_model = create_new_network()
+#         loaded_state_dict = torch.load(generalist_path, map_location="cpu")['model_dict']
+#         network_state_dict = {k.replace("network.", "", 1): v for k, v in loaded_state_dict.items() if k.startswith("network.")}
+#         gen_model.load_state_dict(network_state_dict)
+#         self.models['generalist'] = gen_model.eval()
+
+#         self.source_domains = []
+#         num_total_domains = 4
+#         for d in range(num_total_domains):
+#             if d != test_env:
+#                 self.source_domains.append(d)
+#                 specialist_path = os.path.join(model_path_root, f'specialist_domain_{d}', 'model.pkl')
+#                 spec_model = create_new_network()
+#                 loaded_state_dict = torch.load(specialist_path, map_location="cpu")['model_dict']
+#                 network_state_dict = {k.replace("network.", "", 1): v for k, v in loaded_state_dict.items() if k.startswith("network.")}
+#                 spec_model.load_state_dict(network_state_dict)
+#                 self.models[f'specialist_{d}'] = spec_model.eval()
+        
+#         print(f"HybridEnsemble initialized. Loaded {len(self.models)} models.")
+        
+#         self.CONFIDENCE_THRESHOLD = hparams.get('confidence_thresh', 0.85)
+#         self.fallback_model = hparams.get('fallback_model', 'specialist_2')
+#         self.consensus_mode = hparams.get('consensus_mode', 'majority')
+#         self.specialist_mode = hparams.get('specialist_mode', 'voting')
+
+#     def to(self, device):
+#         for name, model in self.models.items():
+#             self.models[name] = model.to(device)
+#         return self
+
+#     def update(self, minibatches, unlabeled=None):
+#         return {'loss': 0.0}
+
+#     def predict(self, x):
+#         softmax_outputs = {}
+#         with torch.no_grad():
+#             for name, model in self.models.items():
+#                 logits = model(x)
+#                 softmax_outputs[name] = torch.softmax(logits, dim=1)
+
+#         batch_size = x.shape[0]
+#         batch_results = []
+#         gen_softmax = softmax_outputs['generalist']
+#         gen_confs, gen_preds = torch.max(gen_softmax, dim=1)
+        
+#         for i in range(batch_size):
+#             result = {'gen_pred': gen_preds[i].item(), 'gen_confidence': gen_confs[i].item()}
+            
+#             if gen_confs[i] > self.CONFIDENCE_THRESHOLD:
+#                 result.update({'final_pred': gen_preds[i].item(), 'reason': 'GENERALIST_HIGH_CONFIDENCE'})
+            
+#             else:
+#                 poll_details = [{'domain': d, 'vote': torch.argmax(softmax_outputs[f'specialist_{d}'][i]).item(), 'conf': torch.max(softmax_outputs[f'specialist_{d}'][i]).item(), 'softmax': softmax_outputs[f'specialist_{d}'][i]} for d in self.source_domains]
+                
+#                 if self.specialist_mode == 'voting':
+#                     from collections import Counter
+#                     specialist_votes = [d['vote'] for d in poll_details]
+#                     all_votes = specialist_votes + [result['gen_pred']]
+#                     vote_counts = Counter(all_votes)
+#                     most_common_vote = vote_counts.most_common(1)[0]
+#                     consensus_pred, num_votes = most_common_vote[0], most_common_vote[1]
+
+#                     if num_votes == 4:
+#                         result.update({'final_pred': consensus_pred, 'reason': 'UNANIMOUS_CONSENSUS (4/4 agree)', 'gen_softmax': gen_softmax[i].cpu().numpy(), 'spec_poll_details': poll_details})
+#                     elif self.consensus_mode == 'majority' and num_votes == 3:
+#                         result.update({'final_pred': consensus_pred, 'reason': 'MAJORITY_CONSENSUS (3/4 agree)', 'gen_softmax': gen_softmax[i].cpu().numpy(), 'spec_poll_details': poll_details})
+#                     else:
+#                         fallback_pred, reason = -1, ""
+#                         if self.fallback_model == 'erm':
+#                             fallback_pred, reason = result['gen_pred'], 'FALLBACK_TO_GENERALIST (No consensus)'
+#                         else:
+#                             fallback_domain_idx = int(self.fallback_model.split('_')[-1])
+#                             specialist = next(d for d in poll_details if d['domain'] == fallback_domain_idx)
+#                             fallback_pred, reason = specialist['vote'], f'FALLBACK_TO_SPECIALIST_{fallback_domain_idx} (No consensus)'
+#                         result.update({'final_pred': fallback_pred, 'reason': reason, 'gen_softmax': gen_softmax[i].cpu().numpy(), 'spec_poll_details': poll_details})
+
+#                 elif self.specialist_mode == 'weighting':
+#                     # --- THIS IS THE NEW LOGIC ---
+#                     # First, count the votes from all 4 models to determine the sub-reason
+#                     from collections import Counter
+#                     specialist_votes = [d['vote'] for d in poll_details]
+#                     all_votes = specialist_votes + [result['gen_pred']]
+#                     vote_counts = Counter(all_votes)
+#                     most_common_vote = vote_counts.most_common(1)[0]
+#                     num_votes = most_common_vote[1]
+
+#                     reason = ""
+#                     if num_votes == 4:
+#                         reason = 'WEIGHTED_AVG (4/4 Agreed)'
+#                     elif num_votes == 3:
+#                         reason = 'WEIGHTED_AVG (3/4 Agreed)'
+#                     elif num_votes == 2:
+#                         reason = 'WEIGHTED_AVG (2/4 Tie)'
+#                     else:
+#                         reason = 'WEIGHTED_AVG (No Consensus)'
+#                     # ------------------------------------
+
+#                     all_models_confs = [d['conf'] for d in poll_details] + [gen_confs[i].item()]
+#                     confs_tensor = torch.tensor(all_models_confs, device=x.device)
+#                     weights = confs_tensor / confs_tensor.sum()
+
+#                     blended_softmax = torch.zeros_like(poll_details[0]['softmax'])
+#                     # Add specialists' weighted softmaxes
+#                     for idx, detail in enumerate(poll_details):
+#                         blended_softmax += detail['softmax'] * weights[idx]
+#                     # Add the generalist's weighted softmax
+#                     blended_softmax += gen_softmax[i] * weights[-1]
+#                     # -----------------------
+
+#                     final_pred = torch.argmax(blended_softmax).item()
+#                     result.update({'final_pred': final_pred, 'reason': reason, 'gen_softmax': gen_softmax[i].cpu().numpy(), 'spec_poll_details': poll_details, 'blended_softmax': blended_softmax.cpu().numpy()})
+            
+#             batch_results.append(result)
+
+#         return batch_results
     
 '''Specialist only weighting:'''
 # class HybridEnsemble(Algorithm):
