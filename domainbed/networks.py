@@ -352,3 +352,32 @@ class WholeFish(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+class MultiHeadNetwork(torch.nn.Module):
+    """A network with a shared featurizer and multiple classification heads."""
+    def __init__(self, input_shape, num_classes, num_heads, hparams):
+        super().__init__()
+        self.featurizer = Featurizer(input_shape, hparams)
+        self.heads = torch.nn.ModuleList([
+            Classifier(
+                self.featurizer.n_outputs,
+                num_classes,
+                hparams['nonlinear_classifier'])
+            for _ in range(num_heads)
+        ])
+        self.num_heads = num_heads
+
+    def forward(self, x, head_idx=None):
+        """
+        Forward pass. If head_idx is specified, returns output from that head.
+        Otherwise, returns features and outputs from all heads.
+        """
+        features = self.featurizer(x)
+        if head_idx is not None:
+            if not (0 <= head_idx < self.num_heads):
+                 raise ValueError(f"Invalid head_idx: {head_idx}. Must be between 0 and {self.num_heads-1}.")
+            return self.heads[head_idx](features)
+        else:
+            # Return features and a list of outputs from all heads
+            outputs = [head(features) for head in self.heads]
+            return features, outputs

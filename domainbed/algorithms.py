@@ -2618,7 +2618,10 @@ ALGORITHMS = [
     'ERM_CenterTriplet'
     'ERM_Center_Lclsdir'
     'ERM_CenterTriplet_Lclsdir',
-    'HybridEnsemble'
+    'HybridEnsemble',
+    'HybridEnsembleMultiHead',
+    'ERMGeneralistHeadOnly',
+    'FineTuneSpecialistHead',
 ]
 
 def get_algorithm_class(algorithm_name):
@@ -2654,7 +2657,350 @@ class Algorithm(torch.nn.Module):
 import torch
 import os
 from domainbed.lib import misc
-from domainbed import networks # Make sure 'networks' is imported at the top of the file
+from domainbed import networks
+
+class ERMGeneralistHeadOnly(Algorithm):
+    """
+    Trains ONLY Head 0 (Generalist) and the shared backbone of a 
+    MultiHeadNetwork using data from all source domains.
+    Assumes a MultiHeadNetwork with at least 1 head.
+    """
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(ERMGeneralistHeadOnly, self).__init__(input_shape, num_classes, num_domains, hparams)
+        
+        # Determine num_heads needed (num_domains specialists + 1 generalist)
+        num_heads = num_domains + 1 
+        self.network = networks.MultiHeadNetwork(input_shape, num_classes, num_heads, hparams)
+        
+        # --- Optimizer only targets Backbone and Head 0 ---
+        self.optimizer = torch.optim.Adam(
+            list(self.network.featurizer.parameters()) + 
+            list(self.network.heads[0].parameters()), # Only Head 0
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay']
+        )
+        print(">>> ERMGeneralistHeadOnly: Optimizer targets Backbone and Head 0 only.")
+
+    def update(self, minibatches, unlabeled=None):
+        # Combine data from all source domains
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        
+        # Get output ONLY from Head 0
+        generalist_output = self.network(all_x, head_idx=0)
+        loss = torch.nn.functional.cross_entropy(generalist_output, all_y)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {'loss': loss.item()}
+
+    def predict(self, x):
+         # Use Head 0 for evaluation during this stage
+        output = self.network(x, head_idx=0)
+        return torch.softmax(output, dim=1)
+
+class FineTuneSpecialistHead(Algorithm):
+    """
+    Loads a pre-trained MultiHeadNetwork, freezes the backbone, and 
+    fine-tunes ONLY a specified specialist head (1, 2, or 3...) using 
+    data from its corresponding domain ONLY.
+    Requires hparams: 'load_trained_model_path', 'finetune_head_idx'
+    """
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(FineTuneSpecialistHead, self).__init__(input_shape, num_classes, num_domains, hparams)
+        
+        self.network = None # Will be loaded
+
+        model_path = hparams['load_trained_model_path']
+        saved_state = torch.load(model_path, map_location="cpu")
+        train_hparams = saved_state['model_hparams'] 
+
+        num_heads = 0
+        for key in saved_state['model_dict'].keys():
+            if key.startswith("network.heads."):
+                head_idx = int(key.split('.')[2])
+                num_heads = max(num_heads, head_idx + 1)
+        
+        self.network = networks.MultiHeadNetwork(input_shape, num_classes, num_heads, train_hparams)
+        
+        network_state_dict = {k.replace("network.", "", 1): v for k, v in saved_state['model_dict'].items() if k.startswith("network.")}
+        self.network.load_state_dict(network_state_dict)
+        print(f">>> FineTuneSpecialistHead: Loaded model from {model_path}")
+
+        # --- THIS IS THE FIX ---
+        # Freeze the Backbone AND put BN layers in eval mode
+        self.network.featurizer.eval() # Put the entire backbone in eval mode
+        for param in self.network.featurizer.parameters():
+            param.requires_grad = False
+        print(">>> FineTuneSpecialistHead: Backbone (featurizer) frozen AND BN layers set to eval mode.")
+        # -----------------------
+
+        self.target_head_idx = hparams['finetune_head_idx']
+        if not (1 <= self.target_head_idx < self.network.num_heads):
+            raise ValueError(f"Invalid finetune_head_idx: {self.target_head_idx}. Must be > 0 and < {self.network.num_heads}.")
+        
+        # --- Make sure the target head is trainable and in train mode ---
+        self.network.heads[self.target_head_idx].train()
+        for param in self.network.heads[self.target_head_idx].parameters():
+            param.requires_grad = True
+        # -------------------------------------------------------------
+        
+        self.optimizer = torch.optim.Adam(
+            self.network.heads[self.target_head_idx].parameters(), # Only target head
+            lr=self.hparams["lr"], 
+            weight_decay=self.hparams['weight_decay']
+        )
+        print(f">>> FineTuneSpecialistHead: Optimizer targets Head {self.target_head_idx} only.")
+            
+
+    def train(self, mode=True): # <<< FIX: Accept the 'mode' argument
+            """Override train/eval to keep backbone frozen and manage head modes."""
+            super().train(mode) # <<< FIX: Pass the 'mode' to the parent class
+            if mode:
+                # If called as train(True) or train()
+                if hasattr(self, 'network') and self.network is not None:
+                    self.network.featurizer.eval() # Keep backbone frozen in eval mode
+                    for i, head in enumerate(self.network.heads):
+                        if i == self.target_head_idx:
+                            head.train() # Set target head to train mode
+                        else:
+                            head.eval() # Set other heads to eval mode
+            else:
+                # If called as train(False) or eval()
+                if hasattr(self, 'network') and self.network is not None:
+                    self.network.eval() # Set the entire network to eval mode
+            return self
+    def update(self, minibatches, unlabeled=None):
+        if len(minibatches) != 1:
+             raise ValueError("FineTuneSpecialistHead expects exactly one minibatch for the target domain.")
+        
+        x, y = minibatches[0] # Get data for the specialist domain
+            
+        # Get output ONLY from the target specialist head
+        specialist_output = self.network(x, head_idx=self.target_head_idx)
+        loss = torch.nn.functional.cross_entropy(specialist_output, y)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {'loss': loss.item()}
+
+    def predict(self, x):
+         # Use the target specialist head for evaluation during this stage
+        output = self.network(x, head_idx=self.target_head_idx)
+        return torch.softmax(output, dim=1)
+
+'''ERM + Specialist'''
+# class HybridEnsembleMultiHead(Algorithm):
+#     """
+#     Inference using a pre-trained MultiHeadNetwork (1 Generalist + N Specialists).
+#     Uses Head 0 as the 'generalist' and Heads 1..N as 'specialists'.
+#     If Head 0 is uncertain, applies confidence-weighted averaging across ALL heads.
+#     """
+#     def __init__(self, input_shape, num_classes, num_domains, hparams):
+#         super(HybridEnsembleMultiHead, self).__init__(input_shape, num_classes, num_domains, hparams)
+        
+#         self.network = None 
+#         self.optimizer = None
+
+#         model_path = hparams['load_trained_model_path']
+#         saved_state = torch.load(model_path, map_location="cpu")
+#         train_hparams = saved_state['model_hparams']
+
+#         num_heads = 0
+#         for key in saved_state['model_dict'].keys():
+#             if key.startswith("network.heads."):
+#                  head_idx = int(key.split('.')[2])
+#                  num_heads = max(num_heads, head_idx + 1)
+        
+#         self.network = networks.MultiHeadNetwork(input_shape, num_classes, num_heads, train_hparams)
+        
+#         network_state_dict = {k.replace("network.", "", 1): v for k, v in saved_state['model_dict'].items() if k.startswith("network.")}
+#         self.network.load_state_dict(network_state_dict)
+#         self.network.eval()
+        
+#         print(f"HybridEnsembleMultiHead initialized. Loaded model from {model_path}")
+#         print(f"Model has {self.network.num_heads} heads (Head 0 = Generalist, Heads 1..{self.network.num_heads-1} = Specialists).")
+        
+#         self.CONFIDENCE_THRESHOLD = hparams.get('confidence_thresh', 0.85)
+
+#     def to(self, device):
+#         self.network = self.network.to(device)
+#         return self
+
+#     def update(self, minibatches, unlabeled=None):
+#         return {'loss': 0.0}
+
+#     def predict(self, x):
+#         with torch.no_grad():
+#             _, head_outputs_logits = self.network(x)
+#             all_softmax_outputs = [torch.softmax(logits, dim=1) for logits in head_outputs_logits]
+
+#         batch_size = x.shape[0]
+#         batch_results = []
+        
+#         gen_softmax = all_softmax_outputs[0] # Head 0 is the generalist
+#         gen_confs, gen_preds = torch.max(gen_softmax, dim=1)
+        
+#         for i in range(batch_size):
+#             result = {'gen_pred': gen_preds[i].item(), 'gen_confidence': gen_confs[i].item()}
+            
+#             # 1. High-Confidence Generalist (Head 0) Case
+#             if gen_confs[i] > self.CONFIDENCE_THRESHOLD:
+#                 result.update({'final_pred': gen_preds[i].item(), 'reason': 'GENERALIST_HEAD_HIGH_CONFIDENCE'})
+            
+#             # 2. Generalist Head is Uncertain -> Weighted average of ALL Heads
+#             else:
+#                 # --- THIS IS THE FIX ---
+#                 # Gather details for ALL heads (0, 1, 2, 3...)
+#                 all_head_details = []
+#                 for head_idx in range(self.network.num_heads):
+#                     softmax = all_softmax_outputs[head_idx][i]
+#                     conf, pred = torch.max(softmax, dim=0)
+#                     all_head_details.append({
+#                         'domain': head_idx - 1 if head_idx > 0 else 'erm', # Domain index or 'erm'
+#                         'vote': pred.item(),
+#                         'conf': conf.item(),
+#                         'softmax': softmax
+#                     })
+                
+#                 # Perform weighted averaging on ALL heads
+#                 confs_tensor = torch.tensor([d['conf'] for d in all_head_details], device=x.device)
+#                 weights = confs_tensor / (confs_tensor.sum() + 1e-8) # Add epsilon for stability
+                
+#                 blended_softmax = torch.zeros_like(all_head_details[0]['softmax'])
+#                 for idx, detail in enumerate(all_head_details):
+#                     blended_softmax += detail['softmax'] * weights[idx]
+                    
+#                 final_pred = torch.argmax(blended_softmax).item()
+                
+#                 # Determine sub-reason based on vote agreement among ALL heads
+#                 from collections import Counter
+#                 all_votes = [d['vote'] for d in all_head_details]
+#                 vote_counts = Counter(all_votes)
+#                 num_votes = vote_counts.most_common(1)[0][1] if vote_counts else 0
+                
+#                 reason = "WEIGHTED_AVG_ALL_HEADS"
+#                 if num_votes == self.network.num_heads: reason += f" ({num_votes}/{self.network.num_heads} Unanimous)"
+#                 elif num_votes >= (self.network.num_heads + 1) // 2: reason += f" ({num_votes}/{self.network.num_heads} Agree)"
+#                 else: reason += " (No Consensus)"
+
+#                 # Store specialist details separately for logging consistency
+#                 spec_poll_details = [d for d in all_head_details if d['domain'] != 'erm']
+#                 # -----------------------
+
+#                 result.update({'final_pred': final_pred, 'reason': reason, 'gen_softmax': gen_softmax[i].cpu().numpy(), 'spec_poll_details': spec_poll_details, 'blended_softmax': blended_softmax.cpu().numpy()})
+            
+#             batch_results.append(result)
+
+#         return batch_results
+'''Specialist Only HEMH:'''
+class HybridEnsembleMultiHead(Algorithm):
+    """
+    Inference using a pre-trained MultiHeadNetwork (1 Generalist + N Specialists).
+    Uses Head 0 as the 'generalist' and Heads 1..N as 'specialists', 
+    applying confidence-weighted averaging when Head 0 is uncertain.
+    """
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(HybridEnsembleMultiHead, self).__init__(input_shape, num_classes, num_domains, hparams)
+        
+        self.network = None 
+        self.optimizer = None
+
+        model_path = hparams['load_trained_model_path']
+        saved_state = torch.load(model_path, map_location="cpu")
+        train_hparams = saved_state['model_hparams']
+
+        # Determine the number of heads from the saved state dict keys
+        num_heads = 0
+        for key in saved_state['model_dict'].keys():
+            if key.startswith("network.heads."):
+                 head_idx = int(key.split('.')[2])
+                 num_heads = max(num_heads, head_idx + 1)
+        
+        self.network = networks.MultiHeadNetwork(input_shape, num_classes, num_heads, train_hparams)
+        
+        network_state_dict = {k.replace("network.", "", 1): v for k, v in saved_state['model_dict'].items() if k.startswith("network.")}
+        self.network.load_state_dict(network_state_dict)
+        self.network.eval()
+        
+        print(f"HybridEnsembleMultiHead initialized. Loaded model from {model_path}")
+        print(f"Model has {self.network.num_heads} heads (Head 0 = Generalist, Heads 1..{self.network.num_heads-1} = Specialists).")
+        
+        self.CONFIDENCE_THRESHOLD = hparams.get('confidence_thresh', 0.85)
+
+    def to(self, device):
+        self.network = self.network.to(device)
+        return self
+
+    def update(self, minibatches, unlabeled=None):
+        return {'loss': 0.0}
+
+    def predict(self, x):
+        with torch.no_grad():
+            _, head_outputs_logits = self.network(x)
+            all_softmax_outputs = [torch.softmax(logits, dim=1) for logits in head_outputs_logits]
+
+        batch_size = x.shape[0]
+        batch_results = []
+        
+        # --- Head 0 is ALWAYS the Generalist ---
+        gen_softmax = all_softmax_outputs[0] 
+        gen_confs, gen_preds = torch.max(gen_softmax, dim=1)
+        
+        # --- Heads 1, 2, 3... are Specialists ---
+        num_specialist_heads = self.network.num_heads - 1 
+        
+        for i in range(batch_size):
+            result = {'gen_pred': gen_preds[i].item(), 'gen_confidence': gen_confs[i].item()}
+            
+            # 1. High-Confidence Generalist (Head 0) Case
+            if gen_confs[i] > self.CONFIDENCE_THRESHOLD:
+                result.update({'final_pred': gen_preds[i].item(), 'reason': 'GENERALIST_HEAD_HIGH_CONFIDENCE'})
+            
+            # 2. Generalist Head is Uncertain -> Weighted average of Specialist Heads
+            else:
+                poll_details = []
+                specialist_softmaxes = []
+                # Iterate specialists (Heads 1, 2, 3...)
+                for head_idx in range(1, self.network.num_heads): 
+                    spec_softmax = all_softmax_outputs[head_idx][i]
+                    conf, pred = torch.max(spec_softmax, dim=0)
+                    poll_details.append({
+                        'domain': head_idx - 1, # Map Head 1 back to Domain 0, Head 2 to Domain 1 etc.
+                        'vote': pred.item(),
+                        'conf': conf.item(),
+                        'softmax': spec_softmax
+                    })
+                    specialist_softmaxes.append(spec_softmax)
+
+                confs_tensor = torch.tensor([d['conf'] for d in poll_details], device=x.device)
+                weights = confs_tensor / (confs_tensor.sum() + 1e-8)
+                
+                blended_softmax = torch.zeros_like(poll_details[0]['softmax'])
+                for idx, detail in enumerate(poll_details):
+                    blended_softmax += detail['softmax'] * weights[idx]
+                    
+                final_pred = torch.argmax(blended_softmax).item()
+                
+                from collections import Counter
+                votes_only = [d['vote'] for d in poll_details]
+                vote_counts = Counter(votes_only)
+                num_votes = vote_counts.most_common(1)[0][1] if vote_counts else 0
+                
+                reason = "WEIGHTED_AVG_SPECIALIST_HEADS"
+                if num_votes == num_specialist_heads: reason += " (Unanimous Spec)"
+                elif num_votes >= (num_specialist_heads + 1) // 2: reason += f" ({num_votes}/{num_specialist_heads} Spec Agree)"
+                else: reason += " (No Spec Consensus)"
+
+                result.update({'final_pred': final_pred, 'reason': reason, 'gen_softmax': gen_softmax[i].cpu().numpy(), 'spec_poll_details': poll_details, 'blended_softmax': blended_softmax.cpu().numpy()})
+            
+            batch_results.append(result)
+
+        return batch_results
 
 class HybridEnsemble(Algorithm):
     """

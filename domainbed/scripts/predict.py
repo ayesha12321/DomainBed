@@ -13,7 +13,6 @@ from domainbed import algorithms
 from domainbed.lib import misc
 from domainbed.lib.fast_data_loader import FastDataLoader
 
-# This is a function inside domainbed/scripts/predict.py
 def format_log_entry(result, true_label, image_path, global_index, class_names, domain_map):
     """Formats a dictionary of results into a neat string for logging."""
     entry = (
@@ -21,34 +20,29 @@ def format_log_entry(result, true_label, image_path, global_index, class_names, 
         f"SAMPLE #{global_index}\n"
         f"File: {os.path.basename(image_path)}\n"
         f"True Label: {class_names[true_label]}\n"
+        f"Generalist Top Prediction: {class_names[result['gen_pred']]}\n"
         f"------------------------------------------------------------\n"
         f"EVENT: {result['reason']}\n"
+        f"Generalist Confidence: {result['gen_confidence']:.2%}\n"
     )
 
     if 'gen_softmax' in result:
         gen_probs = result['gen_softmax']
         gen_top3_idx = np.argsort(gen_probs)[-3:][::-1]
         gen_top3_str = ", ".join([f"{class_names[i]} ({gen_probs[i]:.2%})" for i in gen_top3_idx])
-        entry += f"Generalist Raw Prediction: {gen_top3_str}\n"
+        entry += f"Generalist Top Predictions (Full): {gen_top3_str}\n"
 
-    # --- THIS IS THE CHANGE: Log the full 4-voter poll results ---
     if 'spec_poll_details' in result:
-        vote_str_parts = []
-        # Add the Generalist's vote to the list first
-        gen_vote_name = class_names[result['gen_pred']]
-        gen_conf = result['gen_confidence']
-        vote_str_parts.append(f"Generalist: {gen_vote_name} ({gen_conf:.1%})")
-
-        # Add the specialists' votes
         poll_details = result['spec_poll_details']
+        vote_str_parts = []
         for detail in sorted(poll_details, key=lambda x: x['domain']):
             domain_name = domain_map.get(detail['domain'], f"Domain {detail['domain']}")
             vote_name = class_names[detail['vote']]
             conf = detail['conf']
             vote_str_parts.append(f"{domain_name}: {vote_name} ({conf:.1%})")
         
-        entry += f"Full Poll Results: [{', '.join(vote_str_parts)}]\n"
-    # -------------------------------------------------------------
+        vote_str = ", ".join(vote_str_parts)
+        entry += f"Specialist Individual Predictions: [{vote_str}]\n"
     
     if 'blended_softmax' in result:
         blend_probs = result['blended_softmax']
@@ -65,13 +59,41 @@ def main(args):
     if torch.cuda.is_available(): device = "cuda"
     else: device = "cpu"
 
-    generalist_model_path = os.path.join(args.model_path_root, 'generalist', 'model.pkl')
-    if not os.path.exists(generalist_model_path):
-        raise FileNotFoundError(f"Generalist model not found at {generalist_model_path}")
-    
-    saved_state = torch.load(generalist_model_path)
-    hparams = saved_state['model_hparams']
-    print("--- Loaded HParams from saved generalist model ---")
+    # --- Load hparams differently based on algorithm ---
+    if args.algorithm == 'HybridEnsembleMultiHead':
+        # --- THIS IS THE CHANGE ---
+        # For MultiHead, load hparams from the saved model file specified by --model_path
+        if not args.model_path:
+             raise ValueError("--model_path is required for HybridEnsembleMultiHead")
+        model_path = args.model_path
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"MultiHead model not found at {model_path}")
+        saved_state = torch.load(model_path)
+        hparams = saved_state['model_hparams']
+        print("--- Loaded HParams from saved MultiHead model ---")
+        # Add inference-specific hparams back in
+        hparams['load_trained_model_path'] = model_path # The algorithm needs this path
+        hparams['confidence_thresh'] = args.confidence_threshold
+        # ---------------------------
+    elif args.algorithm == 'HybridEnsemble':
+        if not args.model_path_root:
+             raise ValueError("--model_path_root is required for HybridEnsemble")
+        generalist_model_path = os.path.join(args.model_path_root, 'generalist', 'model.pkl')
+        if not os.path.exists(generalist_model_path):
+            raise FileNotFoundError(f"Generalist model not found at {generalist_model_path}")
+        saved_state = torch.load(generalist_model_path)
+        hparams = saved_state['model_hparams']
+        print("--- Loaded HParams from saved generalist model ---")
+        hparams['model_path_root'] = args.model_path_root
+        hparams['confidence_thresh'] = args.confidence_threshold
+        hparams['fallback_model'] = args.fallback_model
+        hparams['consensus_mode'] = args.consensus_mode
+        hparams['specialist_mode'] = args.specialist_mode
+    else:
+        hparams = hparams_registry.default_hparams(args.algorithm, args.dataset)
+        if args.hparams: hparams.update(json.loads(args.hparams))
+        print("--- Using Default HParams ---")
+
     for k, v in sorted(hparams.items()): print(f"\t{k}: {v}")
     print("--------------------------------------------------")
 
@@ -89,29 +111,33 @@ def main(args):
     sample_paths = [s[0] for s in test_dataset.samples]
     class_names = test_dataset.classes
 
-    hparams['model_path_root'] = args.model_path_root
-    hparams['test_env'] = test_env_index
-    hparams['confidence_thresh'] = args.confidence_threshold
-    hparams['fallback_model'] = args.fallback_model
-    hparams['consensus_mode'] = args.consensus_mode
-    hparams['specialist_mode'] = args.specialist_mode
+    hparams['test_env'] = test_env_index 
     
     algorithm = vars(algorithms)[args.algorithm](dataset.input_shape, dataset.num_classes, len(dataset) - len(args.test_envs), hparams)
     algorithm.to(device)
 
-    print(f"Loading models from: {args.model_path_root}")
+    print(f"\n--- Starting Inference ---")
+    if args.algorithm == 'HybridEnsembleMultiHead':
+        print(f"Algorithm: HybridEnsembleMultiHead")
+        print(f"Loaded model from: {hparams['load_trained_model_path']}")
+    elif args.algorithm == 'HybridEnsemble':
+         print(f"Algorithm: HybridEnsemble")
+         print(f"Loading models from: {args.model_path_root}")
+         print(f"Using Specialist Mode: {args.specialist_mode.upper()}")
+         if args.specialist_mode == 'voting':
+             print(f"Using Consensus Level: {args.consensus_mode.upper()}")
+             print(f"Using Fallback Model: {args.fallback_model}")
+    else:
+         print(f"Algorithm: {args.algorithm}")
+         
     print(f"Using Generalist Confidence Threshold: {args.confidence_threshold:.2%}")
-    print(f"Using Specialist Mode: {args.specialist_mode.upper()}")
-    if args.specialist_mode == 'voting':
-        print(f"Using Consensus Level: {args.consensus_mode.upper()}")
-        print(f"Using Fallback Model: {args.fallback_model}")
     print(f"Logging noteworthy events to: inference_log.txt")
     print("-" * 30)
 
     total_counts = collections.defaultdict(int)
     correct_counts = collections.defaultdict(int)
 
-    with open("local/inference_log.txt", "w") as log_file:
+    with open("inference_log.txt", "w") as log_file:
         for i, (x, y) in enumerate(test_loader):
             x, y = x.to(device), y.to(device)
             batch_results = algorithm.predict(x)
@@ -123,7 +149,7 @@ def main(args):
                 total_counts[reason] += 1
                 if final_pred == true_label: correct_counts[reason] += 1
 
-                if reason != 'GENERALIST_HIGH_CONFIDENCE':
+                if reason != 'GENERALIST_HIGH_CONFIDENCE' or args.algorithm == 'HybridEnsembleMultiHead':
                     log_entry = format_log_entry(result, true_label, sample_paths[global_index], global_index, class_names, domain_map)
                     log_file.write(log_entry)
 
@@ -151,13 +177,18 @@ if __name__ == "__main__":
     parser.add_argument('--data_dir', type=str, required=True)
     parser.add_argument('--dataset', type=str, required=True)
     parser.add_argument('--algorithm', type=str, required=True)
-    parser.add_argument('--model_path_root', type=str, required=True)
+    parser.add_argument('--model_path_root', type=str, required=False, help='Root directory for HybridEnsemble models.')
+    # --- THIS IS THE CHANGE ---
+    # Added the new --model_path argument
+    parser.add_argument('--model_path', type=str, default=None, help='Path to the single model file (used by MultiHead).')
+    # --------------------------
     parser.add_argument('--test_envs', type=int, nargs='+', required=True)
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--confidence_threshold', type=float, default=0.85, help='Confidence threshold for the generalist model.')
-    parser.add_argument('--fallback_model', type=str, default='specialist_2', choices=['erm', 'specialist_0', 'specialist_1', 'specialist_2'], help='Model to use as fallback.')
-    parser.add_argument('--consensus_mode', type=str, default='majority', choices=['majority', 'strict'], help="Consensus level required from specialists.")
-    parser.add_argument('--specialist_mode', type=str, default='voting', choices=['voting', 'weighting'], help="Method to combine specialists: simple 'voting' or 'weighting' full probabilities.")
-    
+    parser.add_argument('--confidence_threshold', type=float, default=0.85, help='Confidence threshold for the generalist model/head.')
+    parser.add_argument('--fallback_model', type=str, default='specialist_2', choices=['erm', 'specialist_0', 'specialist_1', 'specialist_2'], help='Model to use as fallback (HybridEnsemble voting only).')
+    parser.add_argument('--consensus_mode', type=str, default='majority', choices=['majority', 'strict'], help="Consensus level required (HybridEnsemble voting only).")
+    parser.add_argument('--specialist_mode', type=str, default='voting', choices=['voting', 'weighting'], help="Method to combine specialists (HybridEnsemble only).")
+    parser.add_argument('--hparams', type=str, default=None, help='JSON-serialized hparams dict (used for standard algorithms).')
+
     args = parser.parse_args()
     main(args)
