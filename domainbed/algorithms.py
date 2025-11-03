@@ -2657,7 +2657,6 @@ class Algorithm(torch.nn.Module):
 import torch
 import os
 from domainbed.lib import misc
-<<<<<<< HEAD
 from domainbed import networks
 from domainbed.lib.fast_data_loader import FastDataLoader
 
@@ -3003,9 +3002,7 @@ class HybridEnsembleMultiHead(Algorithm):
             batch_results.append(result)
 
         return batch_results
-=======
 
->>>>>>> f17227e8f8386bb6672a1a30fdf788f3f43b832d
 
 class HybridEnsemble(Algorithm):
     """
