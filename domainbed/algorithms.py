@@ -2898,106 +2898,230 @@ class FineTuneSpecialistHead(Algorithm):
 #             batch_results.append(result)
 
 #         return batch_results
+
+class TrainRouterOnly(Algorithm):
+    """
+    Stage 3: Loads a model with trained Specialists, freezes them,
+    and trains ONLY the Cosine Router.
+    """
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(TrainRouterOnly, self).__init__(input_shape, num_classes, num_domains, hparams)
+        
+        # Force router usage for this stage
+        hparams['use_cosine_router'] = True
+        self.network = networks.MultiHeadNetwork(input_shape, num_classes, hparams['num_heads'], hparams)
+        
+        # Load the Stage 2 model
+        if 'load_trained_model_path' in hparams:
+            path = hparams['load_trained_model_path']
+            print(f"Stage 3: Loading Stage 2 weights from {path}")
+            checkpoint = torch.load(path)
+            
+            # Robust loading logic
+            state_dict = {k.replace("network.", ""): v for k, v in checkpoint['model_dict'].items() if k.startswith("network.")}
+            if not state_dict: state_dict = checkpoint['model_dict']
+            
+            # Fix keys (featurizer vs featurizer.network)
+            fixed_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith("featurizer.") and not k.startswith("featurizer.network."):
+                    fixed_key = k.replace("featurizer.", "featurizer.network.")
+                    if fixed_key in self.network.state_dict():
+                        fixed_state_dict[fixed_key] = v
+                        continue
+                fixed_state_dict[k] = v
+            
+            # Load weights (strict=False because Stage 2 file won't have router weights yet)
+            self.network.load_state_dict(fixed_state_dict, strict=False)
+        
+        # Freeze Backbone & Experts
+        for param in self.network.parameters():
+            param.requires_grad = False
+        
+        # Unfreeze Router
+        for param in self.network.router.parameters():
+            param.requires_grad = True
+            
+        self.optimizer = torch.optim.Adam(
+            self.network.router.parameters(),
+            lr=hparams["lr"],
+            weight_decay=hparams['weight_decay']
+        )
+
+    def update(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+
+        # CRITICAL: Force frozen parts to eval (Protect ResNet BatchNorm stats)
+        self.network.featurizer.eval()
+        self.network.heads.eval()
+        self.network.router.train()
+
+        features, head_outputs, routing_weights = self.network(all_x)
+        
+        # Weighted Average of all heads based on Router
+        gen_softmax = [F.softmax(o, dim=1) for o in head_outputs]
+        blended_softmax = torch.zeros_like(gen_softmax[0])
+        
+        for head_idx in range(len(head_outputs)):
+            w = routing_weights[:, head_idx].unsqueeze(1)
+            blended_softmax += gen_softmax[head_idx] * w
+            
+        loss = F.nll_loss(torch.log(blended_softmax + 1e-6), all_y)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {'loss': loss.item()}
+
+    def predict(self, x):
+        self.network.eval()
+        _, outputs, _ = self.network(x)
+        return outputs[0]
+
 '''Specialist Only HEMH:'''
+from collections import Counter
+
 class HybridEnsembleMultiHead(Algorithm):
     """
-    Inference using a pre-trained MultiHeadNetwork (1 Generalist + N Specialists).
-    Uses Head 0 as the 'generalist' and Heads 1..N as 'specialists', 
-    applying confidence-weighted averaging when Head 0 is uncertain.
+    Inference Algorithm:
+    1. If Generalist Confidence > Threshold -> Use Generalist.
+    2. Else:
+       - If hparam['weighting_mode'] == 'cosine_router' -> Use Router Weights.
+       - Else -> Use Confidence-Weighted Voting (Your logic).
     """
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(HybridEnsembleMultiHead, self).__init__(input_shape, num_classes, num_domains, hparams)
         
-        self.network = None 
-        self.optimizer = None
-
-        model_path = hparams['load_trained_model_path']
-        saved_state = torch.load(model_path, map_location="cpu")
-        train_hparams = saved_state['model_hparams']
-
-        # Determine the number of heads from the saved state dict keys
-        num_heads = 0
-        for key in saved_state['model_dict'].keys():
-            if key.startswith("network.heads."):
-                 head_idx = int(key.split('.')[2])
-                 num_heads = max(num_heads, head_idx + 1)
-        
-        self.network = networks.MultiHeadNetwork(input_shape, num_classes, num_heads, train_hparams)
-        
-        network_state_dict = {k.replace("network.", "", 1): v for k, v in saved_state['model_dict'].items() if k.startswith("network.")}
-        self.network.load_state_dict(network_state_dict)
-        self.network.eval()
-        
-        print(f"HybridEnsembleMultiHead initialized. Loaded model from {model_path}")
-        print(f"Model has {self.network.num_heads} heads (Head 0 = Generalist, Heads 1..{self.network.num_heads-1} = Specialists).")
-        
+        self.network = networks.MultiHeadNetwork(input_shape, num_classes, hparams['num_heads'], hparams)
         self.CONFIDENCE_THRESHOLD = hparams.get('confidence_thresh', 0.85)
+        self.weighting_mode = hparams.get('weighting_mode', 'voting') # Default to voting
+        
+        # --- LOADING LOGIC ---
+        model_path = hparams.get('pretrained_model_path') or hparams.get('load_trained_model_path')
+        if model_path and os.path.exists(model_path):
+            print(f"Loading weights from: {model_path}")
+            checkpoint = torch.load(model_path)
+            raw_state_dict = checkpoint['model_dict']
+            
+            # Clean keys
+            state_dict = {k.replace("network.", ""): v for k, v in raw_state_dict.items() if k.startswith("network.")}
+            if not state_dict: state_dict = raw_state_dict
 
-    def to(self, device):
-        self.network = self.network.to(device)
-        return self
+            # Fix Featurizer mismatch
+            fixed_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith("featurizer.") and not k.startswith("featurizer.network."):
+                    nested_key = k.replace("featurizer.", "featurizer.network.")
+                    if nested_key in self.network.state_dict():
+                        fixed_state_dict[nested_key] = v
+                        continue
+                fixed_state_dict[k] = v
+            
+            self.network.load_state_dict(fixed_state_dict, strict=False)
+            print("Weights loaded successfully.")
+        else:
+            print("WARNING: Using random weights.")
+
+        self.network.eval()
 
     def update(self, minibatches, unlabeled=None):
         return {'loss': 0.0}
 
     def predict(self, x):
         with torch.no_grad():
-            _, head_outputs_logits = self.network(x)
+            # 1. Forward Pass (Get outputs + optional router weights)
+            network_out = self.network(x)
+            
+            # Unpack depending on if Router is active
+            if len(network_out) == 3:
+                _, head_outputs_logits, routing_weights = network_out
+            else:
+                _, head_outputs_logits = network_out
+                routing_weights = None
+
             all_softmax_outputs = [torch.softmax(logits, dim=1) for logits in head_outputs_logits]
 
         batch_size = x.shape[0]
         batch_results = []
         
-        # --- Head 0 is ALWAYS the Generalist ---
-        gen_softmax = all_softmax_outputs[0] 
+        gen_softmax = all_softmax_outputs[0] # Head 0 is Generalist
         gen_confs, gen_preds = torch.max(gen_softmax, dim=1)
-        
-        # --- Heads 1, 2, 3... are Specialists ---
-        num_specialist_heads = self.network.num_heads - 1 
+        num_specialist_heads = len(all_softmax_outputs) - 1
         
         for i in range(batch_size):
             result = {'gen_pred': gen_preds[i].item(), 'gen_confidence': gen_confs[i].item()}
             
-            # 1. High-Confidence Generalist (Head 0) Case
+            # --- PATH 1: High-Confidence Generalist (Fast Path) ---
             if gen_confs[i] > self.CONFIDENCE_THRESHOLD:
-                result.update({'final_pred': gen_preds[i].item(), 'reason': 'GENERALIST_HEAD_HIGH_CONFIDENCE'})
+                result.update({'final_pred': gen_preds[i].item(), 'reason': 'GENERALIST_HEAD_HIGH_CONFIDENCE', 'gen_softmax': gen_softmax[i].cpu().numpy()})
             
-            # 2. Generalist Head is Uncertain -> Weighted average of Specialist Heads
+            # --- PATH 2: Fallback Strategies ---
             else:
-                poll_details = []
-                specialist_softmaxes = []
-                # Iterate specialists (Heads 1, 2, 3...)
-                for head_idx in range(1, self.network.num_heads): 
-                    spec_softmax = all_softmax_outputs[head_idx][i]
-                    conf, pred = torch.max(spec_softmax, dim=0)
-                    poll_details.append({
-                        'domain': head_idx - 1, # Map Head 1 back to Domain 0, Head 2 to Domain 1 etc.
-                        'vote': pred.item(),
-                        'conf': conf.item(),
-                        'softmax': spec_softmax
-                    })
-                    specialist_softmaxes.append(spec_softmax)
-
-                confs_tensor = torch.tensor([d['conf'] for d in poll_details], device=x.device)
-                weights = confs_tensor / (confs_tensor.sum() + 1e-8)
-                
-                blended_softmax = torch.zeros_like(poll_details[0]['softmax'])
-                for idx, detail in enumerate(poll_details):
-                    blended_softmax += detail['softmax'] * weights[idx]
+                # OPTION A: COSINE ROUTER (Only if mode is set AND router weights exist)
+                if self.weighting_mode == 'cosine_router' and routing_weights is not None:
+                    # Use learned router weights
+                    weights = routing_weights[i]
                     
-                final_pred = torch.argmax(blended_softmax).item()
-                
-                from collections import Counter
-                votes_only = [d['vote'] for d in poll_details]
-                vote_counts = Counter(votes_only)
-                num_votes = vote_counts.most_common(1)[0][1] if vote_counts else 0
-                
-                reason = "WEIGHTED_AVG_SPECIALIST_HEADS"
-                if num_votes == num_specialist_heads: reason += " (Unanimous Spec)"
-                elif num_votes >= (num_specialist_heads + 1) // 2: reason += f" ({num_votes}/{num_specialist_heads} Spec Agree)"
-                else: reason += " (No Spec Consensus)"
+                    blended_softmax = torch.zeros_like(gen_softmax[i])
+                    for head_idx in range(len(all_softmax_outputs)):
+                        blended_softmax += all_softmax_outputs[head_idx][i] * weights[head_idx]
+                    
+                    final_pred = torch.argmax(blended_softmax).item()
+                    top_expert = torch.argmax(weights).item()
+                    
+                    result.update({
+                        'final_pred': final_pred, 
+                        'reason': f'ROUTER_WEIGHTED (Top Expert: {top_expert})',
+                        'router_weights': weights.cpu().numpy(),
+                        'blended_softmax': blended_softmax.cpu().numpy(),
+                        'gen_softmax': gen_softmax[i].cpu().numpy()
+                    })
 
-                result.update({'final_pred': final_pred, 'reason': reason, 'gen_softmax': gen_softmax[i].cpu().numpy(), 'spec_poll_details': poll_details, 'blended_softmax': blended_softmax.cpu().numpy()})
+                # OPTION B: VOTING / CONFIDENCE WEIGHTED (Your Logic)
+                else:
+                    poll_details = []
+                    # Iterate specialists (Heads 1..N)
+                    for head_idx in range(1, len(all_softmax_outputs)): 
+                        spec_softmax = all_softmax_outputs[head_idx][i]
+                        conf, pred = torch.max(spec_softmax, dim=0)
+                        poll_details.append({
+                            'domain': head_idx - 1,
+                            'vote': pred.item(),
+                            'conf': conf.item(),
+                            'softmax': spec_softmax
+                        })
+
+                    # Calculate Confidence Weights
+                    confs_tensor = torch.tensor([d['conf'] for d in poll_details], device=x.device)
+                    weights = confs_tensor / (confs_tensor.sum() + 1e-8)
+                    
+                    # Blend
+                    blended_softmax = torch.zeros_like(poll_details[0]['softmax'])
+                    for idx, detail in enumerate(poll_details):
+                        blended_softmax += detail['softmax'] * weights[idx]
+                        
+                    final_pred = torch.argmax(blended_softmax).item()
+                    
+                    # Consensus Reporting
+                    votes_only = [d['vote'] for d in poll_details]
+                    vote_counts = Counter(votes_only)
+                    most_common = vote_counts.most_common(1)
+                    num_votes = most_common[0][1] if most_common else 0
+                    
+                    reason = "WEIGHTED_AVG_SPECIALIST_HEADS"
+                    if num_votes == num_specialist_heads: reason += " (Unanimous Spec)"
+                    elif num_votes >= (num_specialist_heads + 1) // 2: reason += f" ({num_votes}/{num_specialist_heads} Spec Agree)"
+                    else: reason += " (No Spec Consensus)"
+
+                    result.update({
+                        'final_pred': final_pred, 
+                        'reason': reason, 
+                        'spec_poll_details': poll_details, 
+                        'blended_softmax': blended_softmax.cpu().numpy(),
+                        'gen_softmax': gen_softmax[i].cpu().numpy()
+                    })
             
             batch_results.append(result)
 

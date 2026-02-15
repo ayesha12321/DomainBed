@@ -30,6 +30,11 @@ def format_log_entry(result, true_label, image_path, global_index, class_names, 
         gen_top3_str = ", ".join([f"{class_names[i]} ({gen_probs[i]:.2%})" for i in gen_top3_idx])
         entry += f"Generalist Top Predictions (Full): {gen_top3_str}\n"
 
+    if 'router_weights' in result:
+        weights = result['router_weights']
+        weight_str = ", ".join([f"Head {i}: {w:.2f}" for i, w in enumerate(weights)])
+        entry += f"Router Weights: [{weight_str}]\n"
+
     if 'spec_poll_details' in result:
         poll_details = result['spec_poll_details']
         vote_str_parts = []
@@ -63,27 +68,33 @@ def main(args):
 
     # --- Load hparams differently based on algorithm ---
     if args.algorithm == 'HybridEnsembleMultiHead':
-        # --- THIS IS THE CHANGE ---
-        # For MultiHead, load hparams from the saved model file specified by --model_path
         if not args.model_path:
              raise ValueError("--model_path is required for HybridEnsembleMultiHead")
         model_path = args.model_path
         if not os.path.exists(model_path):
              raise FileNotFoundError(f"MultiHead model not found at {model_path}")
-        saved_state = torch.load(model_path)
+        
+        saved_state = torch.load(model_path, map_location='cpu')
         hparams = saved_state['model_hparams']
         print("--- Loaded HParams from saved MultiHead model ---")
-        # Add inference-specific hparams back in
-        hparams['load_trained_model_path'] = model_path # The algorithm needs this path
+        
+        # [CRITICAL FIX] Apply Command Line Overrides
+        if args.hparams:
+            overrides = json.loads(args.hparams)
+            hparams.update(overrides)
+            print(f"--- Applying Command Line HParam Overrides: {overrides} ---")
+
+        hparams['load_trained_model_path'] = model_path 
         hparams['confidence_thresh'] = args.confidence_threshold
         # ---------------------------
+
     elif args.algorithm == 'HybridEnsemble':
         if not args.model_path_root:
              raise ValueError("--model_path_root is required for HybridEnsemble")
         generalist_model_path = os.path.join(args.model_path_root, 'generalist', 'model.pkl')
         if not os.path.exists(generalist_model_path):
              raise FileNotFoundError(f"Generalist model not found at {generalist_model_path}")
-        saved_state = torch.load(generalist_model_path)
+        saved_state = torch.load(generalist_model_path, map_location='cpu')
         hparams = saved_state['model_hparams']
         print("--- Loaded HParams from saved generalist model ---")
         hparams['model_path_root'] = args.model_path_root
@@ -91,10 +102,11 @@ def main(args):
         hparams['fallback_model'] = args.fallback_model
         hparams['consensus_mode'] = args.consensus_mode
         hparams['specialist_mode'] = args.specialist_mode
-        # --- MERGED ---
-        # Added weighting_mode, which was missing from the HEAD branch
         hparams['weighting_mode'] = args.weighting_mode 
-        # ---
+        
+        if args.hparams:
+            hparams.update(json.loads(args.hparams))
+
     else:
         hparams = hparams_registry.default_hparams(args.algorithm, args.dataset)
         if args.hparams: hparams.update(json.loads(args.hparams))
@@ -108,7 +120,6 @@ def main(args):
     if args.dataset == 'PACS':
         domain_map = {0: 'Photo', 1: 'Art', 2: 'Cartoon', 3: 'Sketch'}
     elif args.dataset == 'VLCS':
-        domain_map = {0: 'VOC', 1: 'LabelMe', 2: 'Caltech', 3: 'SUN'}
         domain_map = {0: 'VOC', 1: 'LabelMe', 2: 'Caltech', 3: 'SUN'}
     else:
         domain_map = {}
@@ -126,7 +137,6 @@ def main(args):
 
     hparams['test_env'] = test_env_index 
     
-
     algorithm = vars(algorithms)[args.algorithm](
         dataset.input_shape, 
         dataset.num_classes, 
@@ -136,32 +146,17 @@ def main(args):
     algorithm.to(device)
 
     print(f"\n--- Starting Inference ---")
+    print(f"Algorithm: {args.algorithm}")
     if args.algorithm == 'HybridEnsembleMultiHead':
-        print(f"Algorithm: HybridEnsembleMultiHead")
         print(f"Loaded model from: {hparams['load_trained_model_path']}")
-    elif args.algorithm == 'HybridEnsemble':
-         print(f"Algorithm: HybridEnsemble")
-         print(f"Loading models from: {args.model_path_root}")
-         print(f"Using Specialist Mode: {args.specialist_mode.upper()}")
-         if args.specialist_mode == 'voting':
-             print(f"Using Consensus Level: {args.consensus_mode.upper()}")
-             print(f"Using Fallback Model: {args.fallback_model}")
-
-         elif args.specialist_mode == 'weighting':
-             print(f"Using Weighting Mode: {args.weighting_mode.upper()}")
-    else:
-         print(f"Algorithm: {args.algorithm}")
          
     print(f"Using Generalist Confidence Threshold: {args.confidence_threshold:.2%}")
     
-    log_dir = args.model_path_root  # Start with the default path
-
+    log_dir = args.model_path_root 
     if args.algorithm == 'HybridEnsembleMultiHead':
-        # For MultiHead, the log should be in the same dir as the model file
         log_dir = os.path.dirname(args.model_path)
 
     if log_dir is None:
-        # Fallback for any algorithm (like ERM) run without a root path
         print("Warning: --model_path_root was not provided. Logging to current directory ('.').")
         log_dir = "."
 
@@ -174,19 +169,23 @@ def main(args):
     total_counts = collections.defaultdict(int)
     correct_counts = collections.defaultdict(int)
 
-
     with open(log_path, "w") as log_file:
-        for i, (x, y) in enumerate(test_loader):
-            x, y = x.to(device), y.to(device)
-            batch_results = algorithm.predict(x)
+            for i, (x, y) in enumerate(test_loader):
+                x, y = x.to(device), y.to(device)
+                batch_results = algorithm.predict(x)
 
-            for j, result in enumerate(batch_results):
-                global_index = i * args.batch_size + j
-                final_pred, true_label, reason = result['final_pred'], y[j].item(), result['reason']
+                y_list = y.view(-1).cpu().tolist()
 
-                total_counts[reason] += 1
-                if final_pred == true_label:
-                    correct_counts[reason] += 1
+                for j, result in enumerate(batch_results):
+                    global_index = i * args.batch_size + j
+                    
+                    pred_val = result['final_pred']
+                    true_label = y_list[j]
+                    reason = result['reason']
+
+                    total_counts[reason] += 1
+                    if pred_val == true_label:
+                        correct_counts[reason] += 1
 
                 if reason != 'GENERALIST_HIGH_CONFIDENCE' or args.algorithm == 'HybridEnsembleMultiHead':
                     log_entry = format_log_entry(
@@ -250,8 +249,8 @@ if __name__ == "__main__":
 
     parser.add_argument(
         '--weighting_mode', type=str, default='confidence',
-        choices=['confidence', 'entropy', 'domain','domain_dynamic'],
-        help="Type of weighting used in HybridEnsemble when specialist_mode=weighting."
+        choices=['confidence', 'entropy', 'domain','domain_dynamic', 'cosine_router'],
+        help="Type of weighting used in HybridEnsemble."
     )
     parser.add_argument(
         '--hparams', type=str, default=None, 

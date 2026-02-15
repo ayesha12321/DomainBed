@@ -353,8 +353,23 @@ class WholeFish(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+class CosineRouter(nn.Module):
+    def __init__(self, input_dim, num_experts, temp=1.0):
+        super(CosineRouter, self).__init__()
+        # One prototype vector per expert
+        self.prototypes = nn.Parameter(torch.randn(num_experts, input_dim))
+        self.temp = temp
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, x):
+        # Cosine similarity: (a . b) / (|a| * |b|)
+        x_norm = F.normalize(x, p=2, dim=1)
+        proto_norm = F.normalize(self.prototypes, p=2, dim=1)
+        logits = torch.matmul(x_norm, proto_norm.t()) / self.temp
+        return self.softmax(logits)
+
 class MultiHeadNetwork(torch.nn.Module):
-    """A network with a shared featurizer and multiple classification heads."""
+    """A network with a shared featurizer, multiple classification heads, and optional Router."""
     def __init__(self, input_shape, num_classes, num_heads, hparams):
         super().__init__()
         self.featurizer = Featurizer(input_shape, hparams)
@@ -366,18 +381,30 @@ class MultiHeadNetwork(torch.nn.Module):
             for _ in range(num_heads)
         ])
         self.num_heads = num_heads
+        
+        # --- ROUTER LOGIC ---
+        self.use_cosine_router = hparams.get('use_cosine_router', False)
+        if self.use_cosine_router:
+            self.router = CosineRouter(
+                input_dim=self.featurizer.n_outputs,
+                num_experts=num_heads,
+                temp=hparams.get('router_temp', 1.0)
+            )
 
     def forward(self, x, head_idx=None):
-        """
-        Forward pass. If head_idx is specified, returns output from that head.
-        Otherwise, returns features and outputs from all heads.
-        """
         features = self.featurizer(x)
+        
         if head_idx is not None:
+            # Training a specific head (Stage 1 & 2)
             if not (0 <= head_idx < self.num_heads):
-                 raise ValueError(f"Invalid head_idx: {head_idx}. Must be between 0 and {self.num_heads-1}.")
+                 raise ValueError(f"Invalid head_idx: {head_idx}.")
             return self.heads[head_idx](features)
         else:
-            # Return features and a list of outputs from all heads
+            # Inference or Router Training (Stage 3)
             outputs = [head(features) for head in self.heads]
+            
+            if self.use_cosine_router:
+                routing_weights = self.router(features)
+                return features, outputs, routing_weights
+            
             return features, outputs
