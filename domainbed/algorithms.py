@@ -2622,6 +2622,7 @@ ALGORITHMS = [
     'HybridEnsembleMultiHead',
     'ERMGeneralistHeadOnly',
     'FineTuneSpecialistHead',
+    'GMoE_ERM'
 ]
 
 def get_algorithm_class(algorithm_name):
@@ -2654,11 +2655,57 @@ class Algorithm(torch.nn.Module):
     def predict(self, x):
         raise NotImplementedError
 
-import torch
-import os
-from domainbed.lib import misc
-from domainbed import networks
-from domainbed.lib.fast_data_loader import FastDataLoader
+class GMoE_ERM(Algorithm):
+    """
+    ERM with Spatial Mixture of Experts (GMoE) for CNNs.
+    Optimizes classification loss + load balancing loss for the router.
+    """
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(GMoE_ERM, self).__init__(input_shape, num_classes, num_domains, hparams)
+        
+        # Enforce MoE specific hyperparams
+        self.hparams['use_gmoe'] = True
+        self.hparams.setdefault('gmoe_num_experts', 4)
+        self.hparams.setdefault('gmoe_top_k', 2)
+        self.hparams.setdefault('gmoe_loss_weight', 0.01)
+
+        self.featurizer = networks.Featurizer(input_shape, self.hparams)
+        self.classifier = networks.Classifier(
+            self.featurizer.n_outputs,
+            num_classes,
+            self.hparams['nonlinear_classifier'])
+
+        self.network = nn.Sequential(self.featurizer, self.classifier)
+        self.optimizer = torch.optim.Adam(
+            self.network.parameters(),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay']
+        )
+
+    def update(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        
+        # Forward pass
+        features = self.featurizer(all_x)
+        preds = self.classifier(features)
+        
+        ce_loss = F.cross_entropy(preds, all_y)
+        
+        # Fetch MoE load balancing loss populated in the featurizer forward pass
+        moe_loss = getattr(self.featurizer, 'moe_aux_loss', 0.0)
+        
+        total_loss = ce_loss + (self.hparams['gmoe_loss_weight'] * moe_loss)
+
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+
+        moe_val = moe_loss.item() if torch.is_tensor(moe_loss) else moe_loss
+        return {'loss': total_loss.item(), 'ce_loss': ce_loss.item(), 'moe_loss': moe_val}
+
+    def predict(self, x):
+        return self.network(x)
 
 class ERMGeneralistHeadOnly(Algorithm):
     """

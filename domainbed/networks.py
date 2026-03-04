@@ -102,6 +102,111 @@ class DinoV2(torch.nn.Module):
             ], dim=1)
         return self.dropout(linear_input)
 
+class SpatialCosineRouter(nn.Module):
+    def __init__(self, num_experts, embed_dim, top_k=2, temperature=0.1):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = min(top_k, num_experts)
+        self.temperature = temperature
+        # The learnable codebook for experts (Visual Attributes)
+        self.expert_embeddings = nn.Parameter(torch.randn(num_experts, embed_dim))
+        nn.init.normal_(self.expert_embeddings, std=0.02)
+
+    def forward(self, x):
+        # x shape: [Batch * H * W, Channels] -> e.g., [4704, 512]
+        x_norm = F.normalize(x, p=2, dim=-1)
+        e_norm = F.normalize(self.expert_embeddings, p=2, dim=-1) # Shape: [4, 512]
+        
+        logits = F.linear(x_norm, e_norm) / self.temperature
+        probs = F.softmax(logits, dim=-1)
+        
+        # Select top-k experts
+        topk_probs, topk_indices = torch.topk(probs, self.top_k, dim=-1)
+        
+        # Re-normalize weights among the chosen top-k experts
+        topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-6)
+        
+        # Calculate Load Balancing Auxiliary Losses (Importance and Load)
+        importance = probs.sum(dim=0)
+        load = torch.zeros_like(importance)
+        load.scatter_add_(0, topk_indices.view(-1), torch.ones_like(topk_indices.view(-1), dtype=load.dtype))
+        
+        loss_imp = (importance.std() / (importance.mean() + 1e-10)) ** 2
+        loss_load = (load.std() / (load.mean() + 1e-10)) ** 2
+        aux_loss = loss_imp + loss_load
+        
+        return topk_probs, topk_indices, aux_loss, probs
+class SpatialMoELayer(nn.Module):
+    def __init__(self, in_channels, out_channels, num_experts=4, top_k=2, kernel_size=1, stride=1, padding=0, bias=False):
+        super().__init__()
+        self.num_experts = num_experts
+        self.router = SpatialCosineRouter(num_experts, in_channels, top_k)
+        
+        # Drop-in replacement for any conv. Can handle ResNet50 (1x1) or ResNet18 (3x3).
+        self.experts = nn.ModuleList([
+            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=bias)
+            for _ in range(num_experts)
+        ])
+        self.aux_loss = 0.0
+        self.last_top1_routing = None 
+        
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x_flat = x.permute(0, 2, 3, 1).reshape(-1, C) # View pixels as "tokens"
+        
+        topk_probs, topk_indices, aux_loss, _ = self.router(x_flat)
+        self.aux_loss = aux_loss
+        self.last_top1_routing = topk_indices[:, 0].view(B, H, W).detach() # Save for visualization
+        
+        out = 0
+        for i, expert in enumerate(self.experts):
+            expert_out = expert(x) 
+            
+            # Identify which pixels go to this expert
+            expert_mask = (topk_indices == i) 
+            
+            expert_weights = torch.zeros(B * H * W, device=x.device)
+            expert_weights[expert_mask.any(dim=-1)] = topk_probs[expert_mask]
+            expert_weights = expert_weights.view(B, 1, H, W)
+            
+            out += expert_out * expert_weights
+            
+        return out
+
+def inject_spatial_moe_resnet(model, num_experts=4, top_k=2):
+    """Replaces the final convs in the last two blocks of ResNet layer4 with SpatialMoE"""
+    for name, module in model.named_modules():
+        if name == 'layer4':
+            blocks = list(module.children())
+            replace_indices = [-2, -1] if len(blocks) >= 2 else [-1]
+            
+            for idx in replace_indices:
+                block = blocks[idx]
+                if hasattr(block, 'conv3'): 
+                    # ResNet-50 Bottleneck (Replacing 1x1 conv)
+                    in_c = block.conv3.in_channels
+                    out_c = block.conv3.out_channels
+                    bias = block.conv3.bias is not None
+                    
+                    moe_layer = SpatialMoELayer(in_c, out_c, num_experts, top_k, bias=bias)
+                    for exp in moe_layer.experts:
+                        exp.weight.data = block.conv3.weight.data.clone()
+                        if bias: exp.bias.data = block.conv3.bias.data.clone()
+                    block.conv3 = moe_layer
+                    
+                elif hasattr(block, 'conv2'): 
+                    # ResNet-18 BasicBlock (Replacing 3x3 conv)
+                    in_c = block.conv2.in_channels
+                    out_c = block.conv2.out_channels
+                    bias = block.conv2.bias is not None
+                    
+                    moe_layer = SpatialMoELayer(in_c, out_c, num_experts, top_k, kernel_size=3, padding=1, bias=bias)
+                    for exp in moe_layer.experts:
+                        exp.weight.data = block.conv2.weight.data.clone()
+                        if bias: exp.bias.data = block.conv2.bias.data.clone()
+                    block.conv2 = moe_layer
+
+
 
 class ResNet(torch.nn.Module):
     """ResNet with the softmax chopped off and the batchnorm frozen"""
@@ -117,7 +222,6 @@ class ResNet(torch.nn.Module):
             self.network = torchvision.models.resnet18(weights = None)
             self.n_outputs = 512
         else:
-            # print(">> resnet-50 loading")
             if hparams['resnet50_pretrained']:
                 print(">> resnet-50 loading pretrained")
                 self.network = torchvision.models.resnet50(weights = torchvision.models.ResNet50_Weights.DEFAULT)
@@ -130,33 +234,10 @@ class ResNet(torch.nn.Module):
 
                 self.network = resnet50(weights=None)  
                 self.network.load_state_dict(state_dict)
-                # print(">> resnet-50 loaded")
                 self.n_outputs = 2048
 
         if hparams['resnet50_augmix']:
-            # # gc.collect()
-            # # torch.cuda.empty_cache()
-            # print(">>> [DEBUG] Creating TIMM ResNet50...")
-            # try:
-            #     # Create TIMM ResNet50 model
-            #     self.network = timm.create_model('resnet50.ram_in1k', pretrained=False,weights_only=True)
-
-            #     # Load local checkpoint instead of downloading
-            #     ram_ckpt_path = "/content/resnet50_ram_in1k.pth"
-            #     state_dict = torch.load(ram_ckpt_path, map_location="cpu",)
-            #     print(f">>> [DEBUG] Loaded local RAM weights with {len(state_dict.keys())} keys")
-
-            #     # Load state dict
-            #     self.network.load_state_dict(state_dict, strict=False)
-            #     print(">>> [DEBUG] TIMM ResNet50 (RAM-In1k) loaded successfully!")
-
-            # except Exception as e:
-            #     print(">>> [ERROR] Failed to load TIMM RAM-In1k weights:", e)
-            # self.n_outputs = 2048
             print(">>> [DEBUG] TIMM ResNet50 created successfully")
-
-
-        # self.network = remove_batch_norm_from_resnet(self.network)
 
         # adapt number of channels
         nc = input_shape[0]
@@ -174,15 +255,32 @@ class ResNet(torch.nn.Module):
         del self.network.fc
         self.network.fc = Identity()
 
+        # >>> GMOE INJECTION <<<
+        if hparams.get('use_gmoe', False):
+            print(">>> [DEBUG] Injecting Spatial MoE into ResNet layer4")
+            inject_spatial_moe_resnet(
+                self.network, 
+                num_experts=hparams.get('gmoe_num_experts', 4), 
+                top_k=hparams.get('gmoe_top_k', 2)
+            )
+
         if hparams["freeze_bn"]:
             self.freeze_bn()
         self.hparams = hparams
         self.dropout = nn.Dropout(hparams['resnet_dropout'])
-        self.activation = nn.Identity() # for URM; does not affect other algorithms
+        self.activation = nn.Identity() 
 
     def forward(self, x):
         """Encode x into a feature vector of size n_outputs."""
-        return self.activation(self.dropout(self.network(x)))
+        out = self.activation(self.dropout(self.network(x)))
+        
+        # >>> COLLECT MOE LOAD BALANCING LOSSES <<<
+        self.moe_aux_loss = 0.0
+        for m in self.network.modules():
+            if isinstance(m, SpatialMoELayer):
+                self.moe_aux_loss += m.aux_loss
+                
+        return out
 
     def train(self, mode=True):
         """

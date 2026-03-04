@@ -145,6 +145,14 @@ def main(args):
     )
     algorithm.to(device)
 
+    if args.algorithm not in ['HybridEnsembleMultiHead', 'HybridEnsemble']:
+            if args.model_path:
+                print(f"Loading trained weights for {args.algorithm} from: {args.model_path}")
+                saved_state = torch.load(args.model_path, map_location=device)
+                algorithm.load_state_dict(saved_state['model_dict'], strict=False)
+            else:
+                print("WARNING: No --model_path provided! Evaluating an UNTRAINED model.")
+    
     print(f"\n--- Starting Inference ---")
     print(f"Algorithm: {args.algorithm}")
     if args.algorithm == 'HybridEnsembleMultiHead':
@@ -170,24 +178,39 @@ def main(args):
     correct_counts = collections.defaultdict(int)
 
     with open(log_path, "w") as log_file:
-            for i, (x, y) in enumerate(test_loader):
-                x, y = x.to(device), y.to(device)
-                batch_results = algorithm.predict(x)
+        for i, (x, y) in enumerate(test_loader):
+            x, y = x.to(device), y.to(device)
+            raw_results = algorithm.predict(x)
 
-                y_list = y.view(-1).cpu().tolist()
+            # --- FIX: Standardize outputs for non-ensemble models ---
+            if isinstance(raw_results, torch.Tensor):
+                # Standard algorithm (like GMoE_ERM or ERM) returning raw logits
+                probs = torch.nn.functional.softmax(raw_results, dim=1)
+                confidences, preds = torch.max(probs, dim=1)
+                
+                batch_results = []
+                for b_idx in range(len(preds)):
+                    batch_results.append({
+                        'final_pred': preds[b_idx].item(),
+                        'gen_pred': preds[b_idx].item(),
+                        'gen_confidence': confidences[b_idx].item(),
+                        'reason': 'STANDARD_MODEL_PREDICTION'
+                    })
+            else:
+                # HybridEnsemble returning pre-formatted dictionaries
+                batch_results = raw_results
+            # ---------------------------------------------------------
 
-                for j, result in enumerate(batch_results):
-                    global_index = i * args.batch_size + j
-                    
-                    pred_val = result['final_pred']
-                    true_label = y_list[j]
-                    reason = result['reason']
+            for j, result in enumerate(batch_results):
+                global_index = i * args.batch_size + j
+                final_pred, true_label, reason = result['final_pred'], y[j].item(), result['reason']
 
-                    total_counts[reason] += 1
-                    if pred_val == true_label:
-                        correct_counts[reason] += 1
+                total_counts[reason] += 1
+                if final_pred == true_label:
+                    correct_counts[reason] += 1
 
-                if reason != 'GENERALIST_HIGH_CONFIDENCE' or args.algorithm == 'HybridEnsembleMultiHead':
+                # Log if it's not a standard high confidence ensemble, OR if it's the standard model
+                if reason != 'GENERALIST_HIGH_CONFIDENCE' or args.algorithm in ['HybridEnsembleMultiHead', 'GMoE_ERM']:
                     log_entry = format_log_entry(
                         result, true_label,
                         sample_paths[global_index],
@@ -195,7 +218,6 @@ def main(args):
                         class_names, domain_map
                     )
                     log_file.write(log_entry)
-
     num_total, num_correct = sum(total_counts.values()), sum(correct_counts.values())
     overall_accuracy = num_correct / num_total if num_total > 0 else 0.0
 

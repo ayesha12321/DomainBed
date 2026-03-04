@@ -298,6 +298,12 @@ def _hparams(algorithm, dataset, random_seed):
     _hparam('lars', False, lambda r: False)
     _hparam('linear_steps', 500, lambda r: 500)
     _hparam('resnet_dropout', 0., lambda r: r.choice([0., 0.1, 0.5]))
+
+    _hparam('use_gmoe', False, lambda r: False)
+    _hparam('gmoe_num_experts', 4, lambda r: 4)
+    _hparam('gmoe_top_k', 2, lambda r: 2)
+    _hparam('gmoe_loss_weight', 0.01, lambda r: 10**r.uniform(-3, -1))
+
     _hparam('vit_dropout', 0., lambda r: r.choice([0., 0.1, 0.5]))
     _hparam('class_balanced', False, lambda r: False)
     # TODO: nonlinear classifiers disabled
